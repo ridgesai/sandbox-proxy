@@ -28,9 +28,10 @@ else
   #
   # Pin the real OpenRouter IP so the proxy's own upstream calls (workspace
   # policy check) bypass the Docker DNS alias that would otherwise loop back
-  # to this container. /etc/hosts takes precedence over DNS for all subsequent
-  # lookups, so this resolves before uvicorn starts serving.
-  REAL_IP=$(python -c "import socket; print(socket.getaddrinfo('openrouter.ai', 443, socket.AF_INET)[0][4][0])" 2>/dev/null || true)
+  # to this container. dig @8.8.8.8 bypasses Docker's embedded DNS
+  # (127.0.0.11) entirely. /etc/hosts takes precedence over DNS for all
+  # subsequent lookups, so this resolves before uvicorn starts serving.
+  REAL_IP=$(dig +short openrouter.ai @8.8.8.8 A | grep -E '^[0-9]' | head -1 || true)
   if [ -n "$REAL_IP" ]; then
     echo "$REAL_IP openrouter.ai" >> /etc/hosts
   fi
