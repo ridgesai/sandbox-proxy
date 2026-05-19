@@ -25,6 +25,16 @@ else
   # Docker Compose mode (root): standard low ports, no SNI router needed.
   # Docker's network alias resolves openrouter.ai to this container, so all
   # HTTPS traffic destined for openrouter.ai arrives here directly on :443.
+  #
+  # Pin the real OpenRouter IP so the proxy's own upstream calls (workspace
+  # policy check) bypass the Docker DNS alias that would otherwise loop back
+  # to this container. /etc/hosts takes precedence over DNS for all subsequent
+  # lookups, so this resolves before uvicorn starts serving.
+  REAL_IP=$(python -c "import socket; print(socket.getaddrinfo('openrouter.ai', 443, socket.AF_INET)[0][4][0])" 2>/dev/null || true)
+  if [ -n "$REAL_IP" ]; then
+    echo "$REAL_IP openrouter.ai" >> /etc/hosts
+  fi
+
   uvicorn main:app --host 0.0.0.0 --port 80 &
   exec uvicorn main:app --host 0.0.0.0 --port 443 \
     --ssl-keyfile /certs/server.key \
