@@ -37,6 +37,9 @@ CHAT_ALLOWED_FIELDS = {
     "messages",
     "temperature",
     "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
     "max_tokens",
     "stream",
     "tools",
@@ -47,6 +50,7 @@ CHAT_ALLOWED_FIELDS = {
     "n",
     "response_format",
     "seed",
+    "reasoning",
 }
 
 EMBEDDING_ALLOWED_FIELDS = {
