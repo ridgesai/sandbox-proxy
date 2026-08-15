@@ -37,12 +37,29 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+MAX_INFERENCE_SEED = 2**31 - 1
+
+
+def _env_optional_seed(name: str) -> int | None:
+    raw_value = (os.getenv(name) or "").strip()
+    if not raw_value:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return None
+    if value < 0 or value > MAX_INFERENCE_SEED:
+        return None
+    return value
+
+
 UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai").rstrip("/")
 UPSTREAM_CHAT_PATH = "/api/v1/chat/completions"
 UPSTREAM_EMBEDDING_PATH = "/api/v1/embeddings"
 
 EVALUATION_RUN_ID = os.getenv("EVALUATION_RUN_ID", "unknown-eval-run")
 MAX_COST_USD = _env_float("MAX_COST_USD", 9999.0)
+INFERENCE_SEED = _env_optional_seed("INFERENCE_SEED")
 PROXY_DATA_DIR = os.getenv("PROXY_DATA_DIR", "/proxy-data")
 OPENROUTER_MANAGEMENT_KEY = (os.getenv("OPENROUTER_MANAGEMENT_KEY") or "").strip()
 OPENROUTER_WORKSPACE_ID = (os.getenv("OPENROUTER_WORKSPACE_ID") or "").strip()
@@ -119,6 +136,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     logger.info(
         f"proxy startup eval={EVALUATION_RUN_ID} "
         f"max_cost=${MAX_COST_USD:.4f} "
+        f"inference_seed={INFERENCE_SEED if INFERENCE_SEED is not None else 'unset'} "
         f"restricted_models={restricted_models}"
     )
     yield
@@ -183,6 +201,8 @@ def _prepare_payload(raw: dict[str, Any], endpoint: str) -> dict[str, Any]:
     if endpoint == "chat":
         rewritten["stream"] = False
         rewritten["usage"] = {"include": True}
+        if INFERENCE_SEED is not None:
+            rewritten["seed"] = INFERENCE_SEED
     return rewritten
 
 
