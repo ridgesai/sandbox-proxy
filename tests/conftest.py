@@ -31,6 +31,7 @@ def proxy_modules(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         hashlib.sha256(RUNTIME_API_KEY.encode("utf-8")).hexdigest(),
     )
     monkeypatch.delenv("UPSTREAM_BASE_URL", raising=False)
+    monkeypatch.delenv("INFERENCE_SEED", raising=False)
 
     for name in ("main", "policy", "cost_tracker"):
         sys.modules.pop(name, None)

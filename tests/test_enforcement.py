@@ -274,3 +274,105 @@ async def test_workspace_policy_lookup_failure_returns_503(
 
     assert response.status_code == 503
     assert "workspace policy check failed" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_seed", [None, 999])
+async def test_inference_seed_is_forced(
+    agent_seed: int | None,
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    proxy_modules: dict[str, object],
+) -> None:
+    proxy_modules["main"].INFERENCE_SEED = 123
+    payload = {
+        "model": "deepseek/deepseek-r1-0528",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    if agent_seed is not None:
+        payload["seed"] = agent_seed
+
+    with respx.mock(assert_all_called=True) as router:
+        mock_safe_workspace(router)
+        route = router.post(CHAT_URL).mock(
+            return_value=_chat_response(response_id="chatcmpl-seeded")
+        )
+        response = await client.post(
+            "/api/v1/chat/completions",
+            headers=auth_headers,
+            json=payload,
+        )
+
+    assert response.status_code == 200
+    assert json.loads(route.calls[0].request.content)["seed"] == 123
+
+
+@pytest.mark.asyncio
+async def test_agent_seed_passes_through_when_proxy_seed_is_unset(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+) -> None:
+    with respx.mock(assert_all_called=True) as router:
+        mock_safe_workspace(router)
+        route = router.post(CHAT_URL).mock(
+            return_value=_chat_response(response_id="chatcmpl-agent-seeded")
+        )
+        response = await client.post(
+            "/api/v1/chat/completions",
+            headers=auth_headers,
+            json={
+                "model": "deepseek/deepseek-r1-0528",
+                "messages": [{"role": "user", "content": "hi"}],
+                "seed": 999,
+            },
+        )
+
+    assert response.status_code == 200
+    assert json.loads(route.calls[0].request.content)["seed"] == 999
+
+
+@pytest.mark.asyncio
+async def test_embeddings_do_not_receive_inference_seed(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    proxy_modules: dict[str, object],
+) -> None:
+    proxy_modules["main"].INFERENCE_SEED = 123
+    embedding_url = "https://openrouter.ai/api/v1/embeddings"
+    response_body = {
+        "object": "list",
+        "data": [{"object": "embedding", "index": 0, "embedding": [0.1]}],
+        "model": "qwen/qwen3-embedding-8b",
+        "usage": {"prompt_tokens": 1, "total_tokens": 1},
+    }
+
+    with respx.mock(assert_all_called=True) as router:
+        mock_safe_workspace(router)
+        route = router.post(embedding_url).mock(
+            return_value=httpx.Response(200, json=response_body)
+        )
+        response = await client.post(
+            "/api/v1/embeddings",
+            headers=auth_headers,
+            json={"model": "qwen/qwen3-embedding-8b", "input": "hello"},
+        )
+
+    assert response.status_code == 200
+    assert "seed" not in json.loads(route.calls[0].request.content)
+
+
+def test_env_optional_seed_ignores_blank_invalid_and_out_of_range(
+    proxy_modules: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = proxy_modules["main"]
+
+    for value in ("", "not-an-int", "-1", str(main.MAX_INFERENCE_SEED + 1)):
+        monkeypatch.setenv("INFERENCE_SEED", value)
+        assert main._env_optional_seed("INFERENCE_SEED") is None
+
+    monkeypatch.setenv("INFERENCE_SEED", "0")
+    assert main._env_optional_seed("INFERENCE_SEED") == 0
