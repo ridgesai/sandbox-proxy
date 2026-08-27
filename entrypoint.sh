@@ -22,7 +22,8 @@ else
     echo "$REAL_IP openrouter.ai" >> /etc/hosts
   fi
 
-  uvicorn main:app --host 0.0.0.0 --port 80 &
+  # Routes to single TLS metering process and in-memory cost tracker.
+  socat TCP-LISTEN:80,fork,reuseaddr OPENSSL:127.0.0.1:443,verify=0 &
   exec uvicorn main:app --host 0.0.0.0 --port 443 \
     --ssl-keyfile /certs/server.key \
     --ssl-certfile /certs/server.crt
