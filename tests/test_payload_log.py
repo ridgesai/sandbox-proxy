@@ -35,7 +35,7 @@ def _n(seq: str) -> int:
     return int(seq.rsplit("-", 1)[1])
 
 
-def _rebuild(payloads: list[dict]) -> dict[int, dict]:
+def _rebuild(payloads: list[dict]) -> dict[str, dict]:
     """Reference reader: collect every blob map first, then resolve hashes."""
     blobs: dict[str, object] = {}
     for line in payloads:
@@ -217,6 +217,7 @@ async def test_upstream_error_body_is_logged_in_full(
     (payload,) = _payloads(tmp_path)
     assert payload["response"] == long_error
     assert payload["status_code"] == 502
+    assert len(payload["error"]) <= 200  # the body is stored once, in `response`
 
 
 @pytest.mark.asyncio
@@ -263,7 +264,8 @@ async def test_upstream_failure_is_logged_and_returns_502(
         assert stats["status_code"] == payload["status_code"] == 502
         assert payload["response"] is None
     else:
-        assert payload["returned_status_code"] == 502
+        assert payload["returned_status_code"] == stats["returned_status_code"] == 502
+        assert stats["status_code"] == payload["status_code"]
         assert payload["response"] == {"raw_text": raw_text}
     (rebuilt,) = _rebuild([payload]).values()
     assert rebuilt["messages"] == [{"role": "user", "content": "hi"}]
@@ -285,6 +287,9 @@ async def test_budget_override_is_recorded_as_returned_status(
         response = await _chat(client, auth_headers, [{"role": "user", "content": "hi"}])
 
     assert response.status_code == 429
+    (stats,) = _inferences(tmp_path)
+    assert stats["status_code"] == 200
+    assert stats["returned_status_code"] == 429
     (payload,) = _payloads(tmp_path)
     assert payload["status_code"] == 200
     assert payload["returned_status_code"] == 429
@@ -444,7 +449,16 @@ async def test_append_after_partial_line_does_not_corrupt_next_line(
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("inf", 64 * 1024 * 1024), ("nan", 64 * 1024 * 1024), ("-5", 0), ("1024", 1024)],
+    [
+        ("inf", 64 * 1024 * 1024),
+        ("nan", 64 * 1024 * 1024),
+        ("lots", 64 * 1024 * 1024),
+        ("-5", 0),
+        ("1024", 1024),
+        ("1_000", 1000),
+        ("1e9", 1_000_000_000),
+        ("6.4e7", 64_000_000),
+    ],
 )
 def test_max_payload_log_bytes_parsing(
     monkeypatch: pytest.MonkeyPatch,
@@ -465,3 +479,372 @@ def test_seen_blob_set_is_bounded(proxy_modules: dict[str, object]) -> None:
     main._SEEN_BLOB_LIMIT = 3
     main._mark_blobs_seen([f"h{i}" for i in range(10)])
     assert list(main._seen_blob_hashes) == ["h7", "h8", "h9"]
+
+
+def _line_is_strict(line: str) -> dict:
+    def reject(constant: str) -> None:
+        raise ValueError(f"non-strict JSON constant {constant}")
+
+    return json.loads(line, parse_constant=reject)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        pytest.param(
+            b'{"model": "%s", "messages": [{"role": "user", "content": "cut \\ud83d"}]}'
+            % MODEL.encode(),
+            id="lone-surrogate",
+        ),
+        pytest.param(
+            b'{"model": "%s", "messages": [], "temperature": NaN}' % MODEL.encode(),
+            id="nan",
+        ),
+        pytest.param(
+            b'{"model": "%s", "messages": [], "top_p": Infinity}' % MODEL.encode(),
+            id="infinity",
+        ),
+    ],
+)
+async def test_unencodable_request_is_a_logged_400(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+    raw_body: bytes,
+) -> None:
+    with respx.mock(assert_all_called=False) as router:
+        mock_safe_workspace(router)
+        upstream = router.post(CHAT_URL).mock(return_value=chat_response())
+        response = await client.post(
+            "/api/v1/chat/completions", headers=auth_headers, content=raw_body
+        )
+        assert not upstream.called
+
+    assert response.status_code == 400
+    (stats,) = _inferences(tmp_path)
+    assert stats["status_code"] == 400
+    path = tmp_path / "proxy_inference_payloads.jsonl"
+    lines = path.read_bytes().decode("utf-8").splitlines()  # valid UTF-8
+    assert len(lines) == 1
+    payload = _line_is_strict(lines[0])
+    assert payload["seq"] == stats["seq"]
+    assert payload["status_code"] == 400
+    assert "cannot be encoded" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_short_writes_are_completed_or_reported(
+    proxy_modules: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import errno
+    import os
+
+    main = proxy_modules["main"]
+    real_write = os.write
+    calls = {"n": 0}
+
+    def half_write(fd, data):
+        calls["n"] += 1
+        return real_write(fd, bytes(data)[: max(1, len(data) // 2)])
+
+    monkeypatch.setattr(main.os, "write", half_write)
+    assert main._append_line("a.jsonl", json.dumps({"k": "v" * 50})) is True
+    assert calls["n"] >= 2
+    assert json.loads((tmp_path / "a.jsonl").read_text())["k"] == "v" * 50
+
+    def half_then_enospc(fd, data):
+        if calls["n"] % 2 == 0:
+            calls["n"] += 1
+            return real_write(fd, bytes(data)[: len(data) // 2])
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    calls["n"] = 0
+    monkeypatch.setattr(main.os, "write", half_then_enospc)
+    assert main._append_line("b.jsonl", json.dumps({"k": "v" * 50})) is False
+
+
+@pytest.mark.asyncio
+async def test_failed_payload_write_does_not_mark_hashes_seen(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    proxy_modules: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+
+    main = proxy_modules["main"]
+    real_append = main._append_line
+
+    def fail_payloads(filename: str, line: str) -> bool:
+        if filename == main.PAYLOAD_LOG_FILENAME:
+            main._report_write(filename, OSError(errno.ENOSPC, "full"))
+            return False
+        return real_append(filename, line)
+
+    monkeypatch.setattr(main, "_append_line", fail_payloads)
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=chat_response())
+        response = await _chat(client, auth_headers, [{"role": "user", "content": "a"}])
+
+    assert response.status_code == 200
+    assert len(main._seen_blob_hashes) == 0
+
+
+@pytest.mark.asyncio
+async def test_stats_are_taken_when_the_exchange_finishes(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    proxy_modules: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import threading
+    import time
+
+    main = proxy_modules["main"]
+    gate = threading.Event()
+    real_write = main._write_exchange_logs
+
+    def slow_write(*args, **kwargs):
+        gate.wait(5)
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(main, "_write_exchange_logs", slow_write)
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(
+            side_effect=[
+                chat_response(usage={"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.2}),
+                chat_response(usage={"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.4}),
+            ]
+        )
+        first = asyncio.create_task(_chat(client, auth_headers, [{"role": "user", "content": "a"}]))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(_chat(client, auth_headers, [{"role": "user", "content": "b"}]))
+        await asyncio.sleep(0.05)
+        time.sleep(0.3)  # the log writes sit queued this long
+        gate.set()
+        await asyncio.gather(first, second)
+
+    a, b = sorted(_inferences(tmp_path), key=lambda e: _n(e["seq"]))
+    assert a["total_cost_usd"] == pytest.approx(0.2)
+    assert b["total_cost_usd"] == pytest.approx(0.6)
+    assert a["latency_ms"] < 250 and b["latency_ms"] < 250
+
+
+@pytest.mark.asyncio
+async def test_other_exits_are_logged(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+) -> None:
+    workspace_url = "https://openrouter.ai/api/v1/workspaces/workspace-test"
+    with respx.mock(assert_all_called=False) as router:
+        router.get(workspace_url).mock(return_value=httpx.Response(200, json=[]))
+        upstream = router.post(CHAT_URL).mock(return_value=chat_response())
+        r1 = await _chat(client, auth_headers, [{"role": "user", "content": "1"}])
+        assert not upstream.called
+    assert r1.status_code == 503
+
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(
+            return_value=chat_response(usage={"prompt_tokens": "n/a"})
+        )
+        r2 = await _chat(client, auth_headers, [{"role": "user", "content": "2"}])
+    assert r2.status_code == 502
+
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "model": 5,
+                    "choices": [],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.25},
+                },
+            )
+        )
+        r3 = await _chat(client, auth_headers, [{"role": "user", "content": "3"}])
+    assert r3.status_code == 200
+
+    s1, s2, s3 = _inferences(tmp_path)
+    assert (s1["status_code"], s2["status_code"], s3["status_code"]) == (503, 200, 200)
+    assert s2["returned_status_code"] == 502
+    assert s3["provider"] == "unknown" and s3["routed_model"] is None
+    assert s3["cost_usd"] == 0.25
+    assert len(_payloads(tmp_path)) == 3
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_is_logged_then_propagates(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    proxy_modules: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = proxy_modules["main"]
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("kaput")
+
+    monkeypatch.setattr(main, "_prepare_payload", boom)
+    with pytest.raises(RuntimeError):
+        await _chat(client, auth_headers, [{"role": "user", "content": "a"}])
+
+    (stats,) = _inferences(tmp_path)
+    assert stats["status_code"] == 500
+    assert "kaput" in stats["error"]
+    assert len(_payloads(tmp_path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_write_failures_warn_once_and_recovery_is_reported(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    proxy_modules: dict[str, object],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    import logging
+
+    main = proxy_modules["main"]
+    missing = tmp_path / "missing"
+    main.PROXY_DATA_DIR = str(missing)
+    caplog.set_level(logging.INFO, logger="ridges.proxy")
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=chat_response())
+        for i in range(3):
+            await _chat(client, auth_headers, [{"role": "user", "content": str(i)}])
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert sorted(r.args[0] for r in warnings) == [
+            "proxy_inference_payloads.jsonl",
+            "proxy_inferences.jsonl",
+            "proxy_usage.json",
+        ]
+        missing.mkdir()
+        await _chat(client, auth_headers, [{"role": "user", "content": "ok"}])
+
+    assert sum("works again" in r.getMessage() for r in caplog.records) == 3
+    assert len(_inferences(missing)) == 1
+
+
+@pytest.mark.asyncio
+async def test_log_writes_run_on_one_thread_and_usage_is_written(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    proxy_modules: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import threading
+
+    main = proxy_modules["main"]
+    names: set[str] = set()
+    real_append = main._append_line
+
+    def spy(filename: str, line: str) -> bool:
+        names.add(threading.current_thread().name)
+        return real_append(filename, line)
+
+    monkeypatch.setattr(main, "_append_line", spy)
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=chat_response())
+        await _chat(client, auth_headers, [{"role": "user", "content": "a"}])
+        await _chat(client, auth_headers, [{"role": "user", "content": "b"}])
+
+    assert len(names) == 1 and next(iter(names)).startswith("proxy-log")
+    assert json.loads((tmp_path / "proxy_usage.json").read_text())
+
+
+def test_append_waits_for_the_file_lock(
+    proxy_modules: dict[str, object], tmp_path: Path
+) -> None:
+    import fcntl
+    import os
+    import threading
+
+    main = proxy_modules["main"]
+    path = tmp_path / "locked.jsonl"
+    other = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    fcntl.flock(other, fcntl.LOCK_EX)
+    os.write(other, b'{"seq": 1, "half')  # another process, mid-line
+    results: list[bool] = []
+    thread = threading.Thread(
+        target=lambda: results.append(main._append_line("locked.jsonl", '{"seq": 3}'))
+    )
+    thread.start()
+    thread.join(0.2)
+    assert thread.is_alive()  # blocked on the lock
+
+    os.write(other, b'": "line"}\n{"seq": 2}\n')
+    fcntl.flock(other, fcntl.LOCK_UN)
+    os.close(other)
+    thread.join(5)
+
+    assert results == [True]
+    lines = path.read_text().splitlines()
+    assert [json.loads(line).get("seq") for line in lines] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_is_stored_as_utf8_and_stays_one_line_per_record(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+) -> None:
+    text = "日本語のテキスト" * 5 + "a\u2028b\u0085c\u2029d"
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=chat_response())
+        await _chat(client, auth_headers, [{"role": "user", "content": text}])
+        await _chat(client, auth_headers, [{"role": "user", "content": text + "!"}])
+
+    raw = (tmp_path / "proxy_inference_payloads.jsonl").read_text(encoding="utf-8")
+    assert "日本語のテキスト" in raw  # not \\u-escaped
+    assert len(raw.splitlines()) == 2
+    rebuilt = _rebuild([json.loads(line) for line in raw.splitlines()])
+    assert {r["messages"][0]["content"] for r in rebuilt.values()} == {text, text + "!"}
+
+
+@pytest.mark.asyncio
+async def test_shared_prompt_stays_defined_once_under_a_small_seen_limit(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    proxy_modules: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    proxy_modules["main"]._SEEN_BLOB_LIMIT = 3
+    system = {"role": "system", "content": "shared prompt"}
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=chat_response())
+        for i in range(10):
+            await _chat(
+                client, auth_headers, [system, {"role": "user", "content": f"q{i}"}]
+            )
+
+    definitions = [
+        digest
+        for payload in _payloads(tmp_path)
+        for digest, blob in payload["blobs"].items()
+        if blob == system
+    ]
+    assert len(definitions) == 1
