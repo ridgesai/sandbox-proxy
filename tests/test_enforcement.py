@@ -7,33 +7,10 @@ import httpx
 import pytest
 import respx
 
+from .conftest import chat_response
+
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 WORKSPACE_URL = "https://openrouter.ai/api/v1/workspaces/workspace-test"
-
-
-def _chat_response(
-    model: str = "deepseek/deepseek-r1-0528",
-    *,
-    response_id: str = "chatcmpl-test",
-    usage: dict[str, int | float] | None = None,
-) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            "id": response_id,
-            "object": "chat.completion",
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "ok"},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": usage
-            or {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-        },
-    )
 
 
 @pytest.mark.asyncio
@@ -45,7 +22,7 @@ async def test_unrestricted_model_is_forwarded(
     with respx.mock(assert_all_called=True) as router:
         mock_safe_workspace(router)
         route = router.post(CHAT_URL).mock(
-            return_value=_chat_response("gpt-4o", response_id="chatcmpl-unrestricted")
+            return_value=chat_response("gpt-4o", response_id="chatcmpl-unrestricted")
         )
         response = await client.post(
             "/api/v1/chat/completions",
@@ -102,7 +79,7 @@ async def test_provider_and_body_fields_are_enforced(
     with respx.mock(assert_all_called=True) as router:
         mock_safe_workspace(router)
         route = router.post(CHAT_URL).mock(
-            return_value=_chat_response(response_id="chatcmpl-enforcement")
+            return_value=chat_response(response_id="chatcmpl-enforcement")
         )
         response = await client.post(
             "/api/v1/chat/completions",
@@ -150,7 +127,7 @@ async def test_zdr_is_enforced_even_with_per_model_override(
     with respx.mock(assert_all_called=True) as router:
         mock_safe_workspace(router)
         route = router.post(CHAT_URL).mock(
-            return_value=_chat_response(response_id="chatcmpl-zdr")
+            return_value=chat_response(response_id="chatcmpl-zdr")
         )
         response = await client.post(
             "/api/v1/chat/completions",
@@ -183,7 +160,7 @@ async def test_budget_exceeded_returns_429(
     with respx.mock(assert_all_called=True) as router:
         mock_safe_workspace(router)
         router.post(CHAT_URL).mock(
-            return_value=_chat_response(
+            return_value=chat_response(
                 response_id="chatcmpl-budget",
                 usage={
                     "prompt_tokens": 1000,
@@ -296,7 +273,7 @@ async def test_inference_seed_is_forced(
     with respx.mock(assert_all_called=True) as router:
         mock_safe_workspace(router)
         route = router.post(CHAT_URL).mock(
-            return_value=_chat_response(response_id="chatcmpl-seeded")
+            return_value=chat_response(response_id="chatcmpl-seeded")
         )
         response = await client.post(
             "/api/v1/chat/completions",
@@ -317,7 +294,7 @@ async def test_agent_seed_passes_through_when_proxy_seed_is_unset(
     with respx.mock(assert_all_called=True) as router:
         mock_safe_workspace(router)
         route = router.post(CHAT_URL).mock(
-            return_value=_chat_response(response_id="chatcmpl-agent-seeded")
+            return_value=chat_response(response_id="chatcmpl-agent-seeded")
         )
         response = await client.post(
             "/api/v1/chat/completions",
