@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -61,6 +62,7 @@ EVALUATION_RUN_ID = os.getenv("EVALUATION_RUN_ID", "unknown-eval-run")
 MAX_COST_USD = _env_float("MAX_COST_USD", 9999.0)
 INFERENCE_SEED = _env_optional_seed("INFERENCE_SEED")
 PROXY_DATA_DIR = os.getenv("PROXY_DATA_DIR", "/proxy-data")
+MAX_PAYLOAD_LOG_BYTES = int(_env_float("MAX_PAYLOAD_LOG_BYTES", 64 * 1024 * 1024))
 OPENROUTER_MANAGEMENT_KEY = (os.getenv("OPENROUTER_MANAGEMENT_KEY") or "").strip()
 OPENROUTER_WORKSPACE_ID = (os.getenv("OPENROUTER_WORKSPACE_ID") or "").strip()
 OPENROUTER_EXPECTED_API_KEY_SHA256 = (
@@ -87,15 +89,21 @@ def _flush_usage_to_file() -> None:
         pass
 
 
+def _append_line(filename: str, line: str) -> bool:
+    """Append one line to a file in PROXY_DATA_DIR (best-effort)."""
+    if not PROXY_DATA_DIR:
+        return False
+    try:
+        with open(os.path.join(PROXY_DATA_DIR, filename), "a") as f:
+            f.write(line + "\n")
+        return True
+    except Exception:
+        return False
+
+
 def _append_inference_log(entry: dict[str, Any]) -> None:
     """Append one JSON line to proxy_inferences.jsonl (best-effort)."""
-    if not PROXY_DATA_DIR:
-        return
-    try:
-        with open(os.path.join(PROXY_DATA_DIR, "proxy_inferences.jsonl"), "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
+    _append_line("proxy_inferences.jsonl", json.dumps(entry))
 
 
 # Inference log entry
@@ -111,6 +119,7 @@ class InferenceLogEntry:
     total_cost_usd: float
     budget_remaining_usd: float
     timestamp: str = field(default_factory=_now_iso)
+    seq: int | None = None
     routed_model: str | None = None
     provider: str | None = None
     prompt_tokens: int | None = None
@@ -122,6 +131,119 @@ class InferenceLogEntry:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# Payload log (request/response content, joined to the inference log by `seq`)
+PAYLOAD_LOG_FILENAME = "proxy_inference_payloads.jsonl"
+
+_seq_counter = itertools.count(1)
+_seen_blob_hashes: set[str] = set()
+_payload_bytes_written = 0
+
+
+def _blob_hash(blob: Any) -> str:
+    canonical = json.dumps(blob, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _dedup_request(request: Any) -> tuple[Any, dict[str, Any]]:
+    """Replace `messages` (per message) and `tools` (as one blob) with content hashes.
+
+    Returns (request, blobs first seen by this call).  Chat agents resend the
+    whole conversation and the same tool schemas every turn, so storing them
+    verbatim would grow quadratically.
+
+    Hashes are global content addresses: a line defines a blob only the first
+    time the file mentions it, and requests finish out of `seq` order.  Readers
+    must therefore collect every `blobs` map in the file before resolving
+    hashes, not resolve line by line.
+    """
+    if not isinstance(request, dict):
+        return request, {}
+    deduped = dict(request)
+    blobs: dict[str, Any] = {}
+
+    def intern(blob: Any) -> str:
+        digest = _blob_hash(blob)
+        if digest not in _seen_blob_hashes:
+            blobs[digest] = blob
+        return digest
+
+    if isinstance(request.get("messages"), list):
+        deduped["messages"] = [intern(message) for message in request["messages"]]
+    if isinstance(request.get("tools"), list):
+        deduped["tools"] = intern(request["tools"])
+    return deduped, blobs
+
+
+def _compact_response(endpoint: str, response: Any) -> Any:
+    """Replace embedding vectors with their dimensionality."""
+    if endpoint != "embedding" or not isinstance(response, dict):
+        return response
+    data = response.get("data")
+    if not isinstance(data, list):
+        return response
+    compact = [
+        {**item, "embedding": {"dims": len(item["embedding"])}}
+        if isinstance(item, dict) and isinstance(item.get("embedding"), list)
+        else item
+        for item in data
+    ]
+    return {**response, "data": compact}
+
+
+def _record_payload(
+    *,
+    seq: int,
+    endpoint: str,
+    status_code: int,
+    request: Any,
+    response: Any = None,
+    error: str | None = None,
+    generation_id: str | None = None,
+    returned_status_code: int | None = None,
+) -> None:
+    """Append request/response content to the payload log (best-effort).
+
+    `status_code` is the upstream status; `returned_status_code` is set only
+    when the agent was sent a different one (budget exceeded by this response).
+
+    Synchronous on purpose: with no await between choosing the unseen blobs and
+    recording them, "first seen" always matches file order.  Hashes are only
+    marked seen after a successful write.  Once MAX_PAYLOAD_LOG_BYTES has been
+    written, lines carry no content (`truncated`); the cap is checked before
+    each write, so one oversized line can overshoot it.
+    """
+    global _payload_bytes_written
+    if not PROXY_DATA_DIR:
+        return
+    try:
+        entry: dict[str, Any] = {
+            "seq": seq,
+            "timestamp": _now_iso(),
+            "endpoint": endpoint,
+            "status_code": status_code,
+            "generation_id": generation_id,
+            "error": error,
+        }
+        if returned_status_code is not None:
+            entry["returned_status_code"] = returned_status_code
+        new_blobs: dict[str, Any] = {}
+        if _payload_bytes_written >= MAX_PAYLOAD_LOG_BYTES:
+            entry.update(request=None, response=None, truncated=True)
+        else:
+            deduped, new_blobs = _dedup_request(request)
+            entry.update(
+                request=deduped,
+                blobs=new_blobs,
+                response=_compact_response(endpoint, response),
+            )
+        line = json.dumps(entry)
+        if _append_line(PAYLOAD_LOG_FILENAME, line):
+            _payload_bytes_written += len(line) + 1
+            _seen_blob_hashes.update(new_blobs)
+    except Exception:
+        logger.warning("failed to record payload for seq=%s", seq, exc_info=True)
 
 
 # Lifespan
@@ -212,6 +334,8 @@ def _reject(
     *,
     endpoint: str,
     model: str,
+    seq: int,
+    request: Any,
 ) -> NoReturn:
     _append_inference_log(
         InferenceLogEntry(
@@ -220,14 +344,27 @@ def _reject(
             status_code=status,
             total_cost_usd=cost_tracker.total_cost(),
             budget_remaining_usd=cost_tracker.budget_remaining(),
+            seq=seq,
             error=detail,
         ).to_dict()
+    )
+    _record_payload(
+        seq=seq,
+        endpoint=endpoint,
+        status_code=status,
+        request=request,
+        error=detail,
     )
     raise HTTPException(status_code=status, detail=detail)
 
 
 async def _enforce_runtime_openrouter_policy(
-    *, authorization: str, endpoint: str, model: str
+    *,
+    authorization: str,
+    endpoint: str,
+    model: str,
+    seq: int,
+    request: Any,
 ) -> None:
     """Fail unless the runtime key matches and the workspace is privacy-safe.
 
@@ -238,7 +375,14 @@ async def _enforce_runtime_openrouter_policy(
     """
     token = _extract_bearer_token(authorization)
     if token is None:
-        _reject(401, "Missing Authorization header", endpoint=endpoint, model=model)
+        _reject(
+            401,
+            "Missing Authorization header",
+            endpoint=endpoint,
+            model=model,
+            seq=seq,
+            request=request,
+        )
 
     if (
         not OPENROUTER_EXPECTED_API_KEY_SHA256
@@ -250,6 +394,8 @@ async def _enforce_runtime_openrouter_policy(
             "OpenRouter runtime policy enforcement is not configured",
             endpoint=endpoint,
             model=model,
+            seq=seq,
+            request=request,
         )
 
     if _sha256_hex(token) != OPENROUTER_EXPECTED_API_KEY_SHA256:
@@ -258,6 +404,8 @@ async def _enforce_runtime_openrouter_policy(
             "The runtime OpenRouter API key does not match the uploaded key",
             endpoint=endpoint,
             model=model,
+            seq=seq,
+            request=request,
         )
 
     try:
@@ -271,6 +419,8 @@ async def _enforce_runtime_openrouter_policy(
             f"OpenRouter workspace policy check failed: {type(exc).__name__}: {exc}",
             endpoint=endpoint,
             model=model,
+            seq=seq,
+            request=request,
         )
 
     if workspace_response.status_code >= 400:
@@ -279,6 +429,8 @@ async def _enforce_runtime_openrouter_policy(
             f"OpenRouter workspace policy check failed with status {workspace_response.status_code}",
             endpoint=endpoint,
             model=model,
+            seq=seq,
+            request=request,
         )
 
     try:
@@ -289,6 +441,8 @@ async def _enforce_runtime_openrouter_policy(
             f"OpenRouter workspace policy check returned invalid JSON: {exc}",
             endpoint=endpoint,
             model=model,
+            seq=seq,
+            request=request,
         )
 
     enabled_policy_flags = [
@@ -306,6 +460,8 @@ async def _enforce_runtime_openrouter_policy(
             "OpenRouter workspace logging or data-sharing settings are enabled",
             endpoint=endpoint,
             model=model,
+            seq=seq,
+            request=request,
         )
 
 
@@ -318,6 +474,7 @@ async def _proxy_to_openrouter(
     content_type: str | None,
     payload: dict[str, Any],
 ) -> JSONResponse:
+    seq = next(_seq_counter)
     requested_model = str(payload.get("model", ""))
 
     if not authorization or not authorization.strip():
@@ -326,6 +483,8 @@ async def _proxy_to_openrouter(
             "Missing Authorization header",
             endpoint=endpoint,
             model=requested_model,
+            seq=seq,
+            request=payload,
         )
 
     try:
@@ -336,32 +495,64 @@ async def _proxy_to_openrouter(
             str(exc),
             endpoint=endpoint,
             model=requested_model,
+            seq=seq,
+            request=payload,
         )
 
     model = str(prepared.get("model", ""))
 
     if not cost_tracker.within_budget():
         _reject(
-            429, "Evaluation run cost budget exceeded", endpoint=endpoint, model=model
+            429,
+            "Evaluation run cost budget exceeded",
+            endpoint=endpoint,
+            model=model,
+            seq=seq,
+            request=prepared,
         )
 
     await _enforce_runtime_openrouter_policy(
         authorization=authorization,
         endpoint=endpoint,
         model=model,
+        seq=seq,
+        request=prepared,
     )
 
     start = time.monotonic()
-    upstream_resp = await app.state.upstream.post(
-        f"{UPSTREAM_BASE_URL}{path}",
-        json=prepared,
-        headers=_forward_headers(
-            authorization=authorization, content_type=content_type
-        ),
-    )
-    latency_ms = int((time.monotonic() - start) * 1000)
-
-    body = upstream_resp.json()
+    try:
+        upstream_resp = await app.state.upstream.post(
+            f"{UPSTREAM_BASE_URL}{path}",
+            json=prepared,
+            headers=_forward_headers(
+                authorization=authorization, content_type=content_type
+            ),
+        )
+        latency_ms = int((time.monotonic() - start) * 1000)
+        body = upstream_resp.json()
+    except Exception as exc:
+        # Log the failed exchange, then let the original error propagate.
+        detail = f"{type(exc).__name__}: {exc}"
+        _append_inference_log(
+            InferenceLogEntry(
+                endpoint=endpoint,
+                model=model,
+                status_code=502,
+                total_cost_usd=cost_tracker.total_cost(),
+                budget_remaining_usd=cost_tracker.budget_remaining(),
+                latency_ms=int((time.monotonic() - start) * 1000),
+                seq=seq,
+                error=detail[:200],
+            ).to_dict()
+        )
+        _record_payload(
+            seq=seq,
+            endpoint=endpoint,
+            status_code=502,
+            request=prepared,
+            error=detail,
+        )
+        raise
 
     if upstream_resp.status_code < 400:
         prompt_tokens, completion_tokens, cost = _extract_usage(body)
@@ -382,6 +573,7 @@ async def _proxy_to_openrouter(
                 status_code=upstream_resp.status_code,
                 total_cost_usd=cost_tracker.total_cost(),
                 budget_remaining_usd=cost_tracker.budget_remaining(),
+                seq=seq,
                 routed_model=routed_model,
                 provider=provider,
                 prompt_tokens=prompt_tokens,
@@ -391,7 +583,17 @@ async def _proxy_to_openrouter(
                 generation_id=generation_id,
             ).to_dict()
         )
-        if not cost_tracker.within_budget():
+        over_budget = not cost_tracker.within_budget()
+        _record_payload(
+            seq=seq,
+            endpoint=endpoint,
+            status_code=upstream_resp.status_code,
+            request=prepared,
+            response=body,
+            generation_id=generation_id,
+            returned_status_code=429 if over_budget else None,
+        )
+        if over_budget:
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Evaluation run cost budget exceeded"},
@@ -406,8 +608,17 @@ async def _proxy_to_openrouter(
                 total_cost_usd=cost_tracker.total_cost(),
                 budget_remaining_usd=cost_tracker.budget_remaining(),
                 latency_ms=latency_ms,
+                seq=seq,
                 error=error_snippet,
             ).to_dict()
+        )
+        _record_payload(
+            seq=seq,
+            endpoint=endpoint,
+            status_code=upstream_resp.status_code,
+            request=prepared,
+            response=body,
+            error=error_snippet,
         )
 
     return JSONResponse(status_code=upstream_resp.status_code, content=body)
