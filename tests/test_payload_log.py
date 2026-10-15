@@ -30,6 +30,11 @@ def _inferences(tmp_path: Path) -> list[dict]:
     return _read_jsonl(tmp_path / "proxy_inferences.jsonl")
 
 
+def _n(seq: str) -> int:
+    """Counter part of a `<boot id>-<n>` seq."""
+    return int(seq.rsplit("-", 1)[1])
+
+
 def _rebuild(payloads: list[dict]) -> dict[int, dict]:
     """Reference reader: collect every blob map first, then resolve hashes."""
     blobs: dict[str, object] = {}
@@ -75,14 +80,16 @@ async def test_successful_chat_records_payload_joined_by_seq(
     assert response.status_code == 200
     (stats,) = _inferences(tmp_path)
     (payload,) = _payloads(tmp_path)
-    assert stats["seq"] == payload["seq"] == 1
+    assert stats["seq"] == payload["seq"]
+    assert _n(payload["seq"]) == 1
     assert payload["status_code"] == 200
     assert "returned_status_code" not in payload
     assert payload["generation_id"] == "gen-1"
     assert payload["request"]["model"] == MODEL
     assert payload["request"]["usage"] == {"include": True}
     assert payload["response"]["choices"][0]["message"]["content"] == "hello"
-    assert _rebuild([payload])[1]["messages"] == [{"role": "user", "content": "hi"}]
+    (rebuilt,) = _rebuild([payload]).values()
+    assert rebuilt["messages"] == [{"role": "user", "content": "hi"}]
     assert "sk-fake-test-key" not in (
         tmp_path / "proxy_inference_payloads.jsonl"
     ).read_text()
@@ -108,12 +115,12 @@ async def test_shared_history_is_stored_once(
         await _chat(client, auth_headers, second)
 
     payloads = _payloads(tmp_path)
-    assert [p["seq"] for p in payloads] == [1, 2]
+    assert [_n(p["seq"]) for p in payloads] == [1, 2]
     assert len(payloads[0]["blobs"]) == 1
     assert len(payloads[1]["blobs"]) == 2  # only the two new messages
     rebuilt = _rebuild(payloads)
-    assert rebuilt[1]["messages"] == first
-    assert rebuilt[2]["messages"] == second
+    assert rebuilt[payloads[0]["seq"]]["messages"] == first
+    assert rebuilt[payloads[1]["seq"]]["messages"] == second
 
 
 @pytest.mark.asyncio
@@ -135,7 +142,7 @@ async def test_tools_are_stored_once(
     assert first["request"]["tools"] == second["request"]["tools"]
     assert len(first["blobs"]) == 2  # the message and the tools blob
     assert second["blobs"] == {}
-    assert _rebuild([first, second])[2]["tools"] == tools
+    assert _rebuild([first, second])[second["seq"]]["tools"] == tools
 
 
 @pytest.mark.asyncio
@@ -165,12 +172,11 @@ async def test_out_of_order_completion_needs_collect_then_resolve(
         await asyncio.gather(slow, fast)
 
     payloads = _payloads(tmp_path)
-    assert [p["seq"] for p in payloads] == [2, 1]  # file order != seq order
-    # seq=1 references the shared message but seq=2 (earlier in the file) defined it.
+    assert [_n(p["seq"]) for p in payloads] == [2, 1]  # file order != seq order
+    # seq 1 references the shared message but seq 2 (earlier in the file) defined it.
     assert len(payloads[1]["blobs"]) == 1
     rebuilt = _rebuild(payloads)
-    assert rebuilt[1]["messages"][0] == shared
-    assert rebuilt[2]["messages"][0] == shared
+    assert all(r["messages"][0] == shared for r in rebuilt.values())
 
 
 @pytest.mark.asyncio
@@ -189,7 +195,8 @@ async def test_policy_rejection_records_raw_request_without_response(
     assert payload["status_code"] == 403
     assert payload["response"] is None
     assert "does not match" in payload["error"]
-    assert _rebuild([payload])[1]["messages"] == [{"role": "user", "content": "hi"}]
+    (rebuilt,) = _rebuild([payload]).values()
+    assert rebuilt["messages"] == [{"role": "user", "content": "hi"}]
     assert "wrong-key" not in (tmp_path / "proxy_inference_payloads.jsonl").read_text()
 
 
@@ -214,34 +221,52 @@ async def test_upstream_error_body_is_logged_in_full(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "upstream",
+    ("upstream", "raw_text"),
     [
-        pytest.param({"side_effect": httpx.ConnectTimeout("boom")}, id="transport"),
+        pytest.param({"side_effect": httpx.ConnectTimeout("boom")}, None, id="transport"),
         pytest.param(
-            {"return_value": httpx.Response(200, text="not json")}, id="non-json"
+            {"return_value": httpx.Response(200, text="not json")},
+            "not json",
+            id="non-json",
+        ),
+        pytest.param(
+            {"return_value": httpx.Response(200, json=[1, 2])},
+            "[1,2]",
+            id="json-list",
+        ),
+        pytest.param(
+            {"return_value": httpx.Response(503, text="<html>bad gateway</html>")},
+            "<html>bad gateway</html>",
+            id="html-error",
         ),
     ],
 )
-async def test_upstream_failure_is_logged_and_still_raises(
+async def test_upstream_failure_is_logged_and_returns_502(
     client: httpx.AsyncClient,
     auth_headers: dict[str, str],
     mock_safe_workspace: Callable[[respx.Router], respx.Route],
     tmp_path: Path,
     upstream: dict,
+    raw_text: str | None,
 ) -> None:
     with respx.mock() as router:
         mock_safe_workspace(router)
         router.post(CHAT_URL).mock(**upstream)
-        with pytest.raises(Exception):
-            await _chat(client, auth_headers, [{"role": "user", "content": "hi"}])
+        response = await _chat(client, auth_headers, [{"role": "user", "content": "hi"}])
 
+    assert response.status_code == 502
     (stats,) = _inferences(tmp_path)
     (payload,) = _payloads(tmp_path)
-    assert stats["seq"] == payload["seq"] == 1
-    assert stats["status_code"] == payload["status_code"] == 502
-    assert payload["response"] is None
+    assert stats["seq"] == payload["seq"]
     assert payload["error"]
-    assert _rebuild([payload])[1]["messages"] == [{"role": "user", "content": "hi"}]
+    if raw_text is None:  # transport error: nothing came back
+        assert stats["status_code"] == payload["status_code"] == 502
+        assert payload["response"] is None
+    else:
+        assert payload["returned_status_code"] == 502
+        assert payload["response"] == {"raw_text": raw_text}
+    (rebuilt,) = _rebuild([payload]).values()
+    assert rebuilt["messages"] == [{"role": "user", "content": "hi"}]
 
 
 @pytest.mark.asyncio
@@ -320,7 +345,7 @@ async def test_payload_cap_truncates_and_does_not_mark_hashes_seen(
     assert "truncated" not in first
     assert second["truncated"] is True
     assert second["request"] is None and second["response"] is None
-    assert [p["seq"] for p in (first, second)] == [1, 2]
+    assert [_n(p["seq"]) for p in (first, second)] == [1, 2]
     assert len(main._seen_blob_hashes) == 1  # "b" was never written
 
 
@@ -342,3 +367,101 @@ async def test_payload_logging_failure_does_not_break_proxying(
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "fine"
     assert len(main._seen_blob_hashes) == 0
+
+
+@pytest.mark.asyncio
+async def test_base64_embeddings_are_compacted(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+) -> None:
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(EMBEDDING_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "emb-2",
+                    "model": "openai/text-embedding-3-small",
+                    "data": [{"index": 0, "embedding": "A" * 400}],
+                    "usage": {"prompt_tokens": 2, "cost": 0.0},
+                },
+            )
+        )
+        await client.post(
+            "/api/v1/embeddings",
+            headers=auth_headers,
+            json={
+                "model": "openai/text-embedding-3-small",
+                "input": "hello",
+                "encoding_format": "base64",
+            },
+        )
+
+    (payload,) = _payloads(tmp_path)
+    assert payload["response"]["data"][0]["embedding"] == {"base64_chars": 400}
+
+
+@pytest.mark.asyncio
+async def test_existing_oversized_file_is_already_truncated(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    proxy_modules: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    """The cap follows the file size, so it survives restarts and other processes."""
+    proxy_modules["main"].MAX_PAYLOAD_LOG_BYTES = 10
+    (tmp_path / "proxy_inference_payloads.jsonl").write_text('{"old": "line"}\n')
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=chat_response())
+        await _chat(client, auth_headers, [{"role": "user", "content": "a"}])
+
+    _, new = _payloads(tmp_path)
+    assert new["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_append_after_partial_line_does_not_corrupt_next_line(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "proxy_inference_payloads.jsonl"
+    path.write_text('{"seq": "cut-off')  # a write that died mid-line
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=chat_response())
+        await _chat(client, auth_headers, [{"role": "user", "content": "a"}])
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[1])["status_code"] == 200
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("inf", 64 * 1024 * 1024), ("nan", 64 * 1024 * 1024), ("-5", 0), ("1024", 1024)],
+)
+def test_max_payload_log_bytes_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_modules: dict[str, object],
+    raw: str,
+    expected: int,
+) -> None:
+    import importlib
+    import sys
+
+    monkeypatch.setenv("MAX_PAYLOAD_LOG_BYTES", raw)
+    sys.modules.pop("main", None)
+    assert importlib.import_module("main").MAX_PAYLOAD_LOG_BYTES == expected
+
+
+def test_seen_blob_set_is_bounded(proxy_modules: dict[str, object]) -> None:
+    main = proxy_modules["main"]
+    main._SEEN_BLOB_LIMIT = 3
+    main._mark_blobs_seen([f"h{i}" for i in range(10)])
+    assert list(main._seen_blob_hashes) == ["h7", "h8", "h9"]

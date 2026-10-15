@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import itertools
 import json
 import logging
 import os
+import threading
 import time
+import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -38,6 +42,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw_value = (os.getenv(name) or "").strip()
+    if not raw_value:
+        return default
+    try:
+        return max(int(raw_value), minimum)
+    except ValueError:
+        return default
+
+
 MAX_INFERENCE_SEED = 2**31 - 1
 
 
@@ -62,7 +76,7 @@ EVALUATION_RUN_ID = os.getenv("EVALUATION_RUN_ID", "unknown-eval-run")
 MAX_COST_USD = _env_float("MAX_COST_USD", 9999.0)
 INFERENCE_SEED = _env_optional_seed("INFERENCE_SEED")
 PROXY_DATA_DIR = os.getenv("PROXY_DATA_DIR", "/proxy-data")
-MAX_PAYLOAD_LOG_BYTES = int(_env_float("MAX_PAYLOAD_LOG_BYTES", 64 * 1024 * 1024))
+MAX_PAYLOAD_LOG_BYTES = _env_int("MAX_PAYLOAD_LOG_BYTES", 64 * 1024 * 1024)
 OPENROUTER_MANAGEMENT_KEY = (os.getenv("OPENROUTER_MANAGEMENT_KEY") or "").strip()
 OPENROUTER_WORKSPACE_ID = (os.getenv("OPENROUTER_WORKSPACE_ID") or "").strip()
 OPENROUTER_EXPECTED_API_KEY_SHA256 = (
@@ -90,12 +104,26 @@ def _flush_usage_to_file() -> None:
 
 
 def _append_line(filename: str, line: str) -> bool:
-    """Append one line to a file in PROXY_DATA_DIR (best-effort)."""
+    """Append one line to a file in PROXY_DATA_DIR (best-effort).
+
+    The line goes out in a single write.  If the file does not end in a newline
+    (an earlier write was cut short), a newline is written first so the new line
+    cannot be glued onto the fragment.
+    """
     if not PROXY_DATA_DIR:
         return False
     try:
-        with open(os.path.join(PROXY_DATA_DIR, filename), "a") as f:
-            f.write(line + "\n")
+        fd = os.open(
+            os.path.join(PROXY_DATA_DIR, filename),
+            os.O_RDWR | os.O_APPEND | os.O_CREAT,
+            0o644,
+        )
+        try:
+            size = os.fstat(fd).st_size
+            prefix = b"\n" if size and os.pread(fd, 1, size - 1) != b"\n" else b""
+            os.write(fd, prefix + line.encode("utf-8") + b"\n")
+        finally:
+            os.close(fd)
         return True
     except Exception:
         return False
@@ -119,7 +147,7 @@ class InferenceLogEntry:
     total_cost_usd: float
     budget_remaining_usd: float
     timestamp: str = field(default_factory=_now_iso)
-    seq: int | None = None
+    seq: str | None = None
     routed_model: str | None = None
     provider: str | None = None
     prompt_tokens: int | None = None
@@ -136,14 +164,31 @@ class InferenceLogEntry:
 # Payload log (request/response content, joined to the inference log by `seq`)
 PAYLOAD_LOG_FILENAME = "proxy_inference_payloads.jsonl"
 
+# `seq` is "<boot id>-<n>": the counter is per process, so the boot id keeps
+# the two uvicorn processes (and restarts) from reusing each other's values.
+_BOOT_ID = uuid.uuid4().hex[:8]
 _seq_counter = itertools.count(1)
-_seen_blob_hashes: set[str] = set()
-_payload_bytes_written = 0
+
+_SEEN_BLOB_LIMIT = 200_000
+_seen_blob_hashes: OrderedDict[str, None] = OrderedDict()
+_log_lock = threading.Lock()
+
+
+def _next_seq() -> str:
+    return f"{_BOOT_ID}-{next(_seq_counter)}"
 
 
 def _blob_hash(blob: Any) -> str:
     canonical = json.dumps(blob, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return hashlib.blake2b(canonical.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _mark_blobs_seen(hashes: Any) -> None:
+    for digest in hashes:
+        _seen_blob_hashes[digest] = None
+        _seen_blob_hashes.move_to_end(digest)
+    while len(_seen_blob_hashes) > _SEEN_BLOB_LIMIT:
+        _seen_blob_hashes.popitem(last=False)
 
 
 def _dedup_request(request: Any) -> tuple[Any, dict[str, Any]]:
@@ -153,10 +198,12 @@ def _dedup_request(request: Any) -> tuple[Any, dict[str, Any]]:
     whole conversation and the same tool schemas every turn, so storing them
     verbatim would grow quadratically.
 
-    Hashes are global content addresses: a line defines a blob only the first
-    time the file mentions it, and requests finish out of `seq` order.  Readers
+    Hashes are global content addresses: a line defines a blob the first time
+    this process mentions it, and requests finish out of `seq` order.  Readers
     must therefore collect every `blobs` map in the file before resolving
-    hashes, not resolve line by line.
+    hashes, not resolve line by line.  A blob can be defined more than once
+    (after a restart, from the other proxy process, or after eviction from the
+    bounded seen-set); the content is always identical.
     """
     if not isinstance(request, dict):
         return request, {}
@@ -177,73 +224,130 @@ def _dedup_request(request: Any) -> tuple[Any, dict[str, Any]]:
 
 
 def _compact_response(endpoint: str, response: Any) -> Any:
-    """Replace embedding vectors with their dimensionality."""
+    """Replace embedding vectors with their size."""
     if endpoint != "embedding" or not isinstance(response, dict):
         return response
     data = response.get("data")
     if not isinstance(data, list):
         return response
-    compact = [
-        {**item, "embedding": {"dims": len(item["embedding"])}}
-        if isinstance(item, dict) and isinstance(item.get("embedding"), list)
-        else item
-        for item in data
-    ]
-    return {**response, "data": compact}
+
+    def compact_item(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        embedding = item.get("embedding")
+        if isinstance(embedding, list):
+            return {**item, "embedding": {"dims": len(embedding)}}
+        if isinstance(embedding, str):  # encoding_format="base64"
+            return {**item, "embedding": {"base64_chars": len(embedding)}}
+        return item
+
+    return {**response, "data": [compact_item(item) for item in data]}
 
 
-def _record_payload(
+@dataclass
+class _Exchange:
+    """One proxied request, carried through every exit path for logging."""
+
+    seq: str
+    endpoint: str
+    model: str
+    request: Any
+    start: float | None = None
+
+
+def _write_exchange_logs(
+    ex: _Exchange,
     *,
-    seq: int,
-    endpoint: str,
     status_code: int,
-    request: Any,
-    response: Any = None,
-    error: str | None = None,
-    generation_id: str | None = None,
-    returned_status_code: int | None = None,
+    error: str | None,
+    response: Any,
+    returned_status_code: int | None,
+    stats: dict[str, Any],
 ) -> None:
-    """Append request/response content to the payload log (best-effort).
+    """Append the stats line and the payload line for one exchange (best-effort).
 
     `status_code` is the upstream status; `returned_status_code` is set only
-    when the agent was sent a different one (budget exceeded by this response).
-
-    Synchronous on purpose: with no await between choosing the unseen blobs and
-    recording them, "first seen" always matches file order.  Hashes are only
-    marked seen after a successful write.  Once MAX_PAYLOAD_LOG_BYTES has been
-    written, lines carry no content (`truncated`); the cap is checked before
-    each write, so one oversized line can overshoot it.
+    when the agent was sent a different one.  Blocking, so callers run it in a
+    thread.  The lock keeps "first seen" in line with file order for the blobs
+    this process defines.  Once the payload file reaches MAX_PAYLOAD_LOG_BYTES,
+    lines carry no content (`truncated`); the size is checked before each write,
+    so one oversized line can overshoot the cap.  Hashes are only marked seen
+    after a successful write.
     """
-    global _payload_bytes_written
-    if not PROXY_DATA_DIR:
-        return
-    try:
-        entry: dict[str, Any] = {
-            "seq": seq,
-            "timestamp": _now_iso(),
-            "endpoint": endpoint,
-            "status_code": status_code,
-            "generation_id": generation_id,
-            "error": error,
-        }
-        if returned_status_code is not None:
-            entry["returned_status_code"] = returned_status_code
-        new_blobs: dict[str, Any] = {}
-        if _payload_bytes_written >= MAX_PAYLOAD_LOG_BYTES:
-            entry.update(request=None, response=None, truncated=True)
-        else:
-            deduped, new_blobs = _dedup_request(request)
-            entry.update(
-                request=deduped,
-                blobs=new_blobs,
-                response=_compact_response(endpoint, response),
+    with _log_lock:
+        try:
+            _append_inference_log(
+                InferenceLogEntry(
+                    endpoint=ex.endpoint,
+                    model=ex.model,
+                    status_code=status_code,
+                    total_cost_usd=cost_tracker.total_cost(),
+                    budget_remaining_usd=cost_tracker.budget_remaining(),
+                    seq=ex.seq,
+                    latency_ms=(
+                        int((time.monotonic() - ex.start) * 1000)
+                        if ex.start is not None
+                        else None
+                    ),
+                    error=error[:200] if error else None,
+                    **stats,
+                ).to_dict()
             )
-        line = json.dumps(entry)
-        if _append_line(PAYLOAD_LOG_FILENAME, line):
-            _payload_bytes_written += len(line) + 1
-            _seen_blob_hashes.update(new_blobs)
-    except Exception:
-        logger.warning("failed to record payload for seq=%s", seq, exc_info=True)
+        except Exception:
+            logger.warning("failed to record stats for seq=%s", ex.seq, exc_info=True)
+
+        if not PROXY_DATA_DIR:
+            return
+        try:
+            entry: dict[str, Any] = {
+                "seq": ex.seq,
+                "timestamp": _now_iso(),
+                "endpoint": ex.endpoint,
+                "status_code": status_code,
+                "generation_id": stats.get("generation_id"),
+                "error": error,
+            }
+            if returned_status_code is not None:
+                entry["returned_status_code"] = returned_status_code
+            new_blobs: dict[str, Any] = {}
+            try:
+                size = os.path.getsize(os.path.join(PROXY_DATA_DIR, PAYLOAD_LOG_FILENAME))
+            except OSError:
+                size = 0
+            if size >= MAX_PAYLOAD_LOG_BYTES:
+                entry.update(request=None, response=None, truncated=True)
+            else:
+                deduped, new_blobs = _dedup_request(ex.request)
+                entry.update(
+                    request=deduped,
+                    blobs=new_blobs,
+                    response=_compact_response(ex.endpoint, response),
+                )
+            if _append_line(PAYLOAD_LOG_FILENAME, json.dumps(entry)):
+                _mark_blobs_seen(new_blobs)
+        except Exception:
+            logger.warning("failed to record payload for seq=%s", ex.seq, exc_info=True)
+
+
+async def _log_exchange(
+    ex: _Exchange,
+    *,
+    status_code: int,
+    error: str | None = None,
+    response: Any = None,
+    returned_status_code: int | None = None,
+    **stats: Any,
+) -> None:
+    """Log one exchange to both files without blocking the event loop."""
+    await asyncio.to_thread(
+        _write_exchange_logs,
+        ex,
+        status_code=status_code,
+        error=error,
+        response=response,
+        returned_status_code=returned_status_code,
+        stats=stats,
+    )
 
 
 # Lifespan
@@ -328,43 +432,13 @@ def _prepare_payload(raw: dict[str, Any], endpoint: str) -> dict[str, Any]:
     return rewritten
 
 
-def _reject(
-    status: int,
-    detail: str,
-    *,
-    endpoint: str,
-    model: str,
-    seq: int,
-    request: Any,
-) -> NoReturn:
-    _append_inference_log(
-        InferenceLogEntry(
-            endpoint=endpoint,
-            model=model,
-            status_code=status,
-            total_cost_usd=cost_tracker.total_cost(),
-            budget_remaining_usd=cost_tracker.budget_remaining(),
-            seq=seq,
-            error=detail,
-        ).to_dict()
-    )
-    _record_payload(
-        seq=seq,
-        endpoint=endpoint,
-        status_code=status,
-        request=request,
-        error=detail,
-    )
+async def _reject(ex: _Exchange, status: int, detail: str) -> NoReturn:
+    await _log_exchange(ex, status_code=status, error=detail)
     raise HTTPException(status_code=status, detail=detail)
 
 
 async def _enforce_runtime_openrouter_policy(
-    *,
-    authorization: str,
-    endpoint: str,
-    model: str,
-    seq: int,
-    request: Any,
+    *, authorization: str, ex: _Exchange
 ) -> None:
     """Fail unless the runtime key matches and the workspace is privacy-safe.
 
@@ -375,37 +449,20 @@ async def _enforce_runtime_openrouter_policy(
     """
     token = _extract_bearer_token(authorization)
     if token is None:
-        _reject(
-            401,
-            "Missing Authorization header",
-            endpoint=endpoint,
-            model=model,
-            seq=seq,
-            request=request,
-        )
+        await _reject(ex, 401, "Missing Authorization header")
 
     if (
         not OPENROUTER_EXPECTED_API_KEY_SHA256
         or not OPENROUTER_MANAGEMENT_KEY
         or not OPENROUTER_WORKSPACE_ID
     ):
-        _reject(
-            503,
-            "OpenRouter runtime policy enforcement is not configured",
-            endpoint=endpoint,
-            model=model,
-            seq=seq,
-            request=request,
+        await _reject(
+            ex, 503, "OpenRouter runtime policy enforcement is not configured"
         )
 
     if _sha256_hex(token) != OPENROUTER_EXPECTED_API_KEY_SHA256:
-        _reject(
-            403,
-            "The runtime OpenRouter API key does not match the uploaded key",
-            endpoint=endpoint,
-            model=model,
-            seq=seq,
-            request=request,
+        await _reject(
+            ex, 403, "The runtime OpenRouter API key does not match the uploaded key"
         )
 
     try:
@@ -414,35 +471,26 @@ async def _enforce_runtime_openrouter_policy(
             headers={"Authorization": f"Bearer {OPENROUTER_MANAGEMENT_KEY}"},
         )
     except httpx.HTTPError as exc:
-        _reject(
+        await _reject(
+            ex,
             503,
             f"OpenRouter workspace policy check failed: {type(exc).__name__}: {exc}",
-            endpoint=endpoint,
-            model=model,
-            seq=seq,
-            request=request,
         )
 
     if workspace_response.status_code >= 400:
-        _reject(
+        await _reject(
+            ex,
             503,
             f"OpenRouter workspace policy check failed with status {workspace_response.status_code}",
-            endpoint=endpoint,
-            model=model,
-            seq=seq,
-            request=request,
         )
 
     try:
         workspace_data = workspace_response.json().get("data") or {}
     except ValueError as exc:
-        _reject(
+        await _reject(
+            ex,
             503,
             f"OpenRouter workspace policy check returned invalid JSON: {exc}",
-            endpoint=endpoint,
-            model=model,
-            seq=seq,
-            request=request,
         )
 
     enabled_policy_flags = [
@@ -455,13 +503,8 @@ async def _enforce_runtime_openrouter_policy(
         if bool(workspace_data.get(flag_name))
     ]
     if enabled_policy_flags:
-        _reject(
-            403,
-            "OpenRouter workspace logging or data-sharing settings are enabled",
-            endpoint=endpoint,
-            model=model,
-            seq=seq,
-            request=request,
+        await _reject(
+            ex, 403, "OpenRouter workspace logging or data-sharing settings are enabled"
         )
 
 
@@ -474,52 +517,30 @@ async def _proxy_to_openrouter(
     content_type: str | None,
     payload: dict[str, Any],
 ) -> JSONResponse:
-    seq = next(_seq_counter)
-    requested_model = str(payload.get("model", ""))
+    ex = _Exchange(
+        seq=_next_seq(),
+        endpoint=endpoint,
+        model=str(payload.get("model", "")),
+        request=payload,
+    )
 
     if not authorization or not authorization.strip():
-        _reject(
-            401,
-            "Missing Authorization header",
-            endpoint=endpoint,
-            model=requested_model,
-            seq=seq,
-            request=payload,
-        )
+        await _reject(ex, 401, "Missing Authorization header")
 
     try:
         prepared = _prepare_payload(payload, endpoint=endpoint)
     except PolicyError as exc:
-        _reject(
-            403,
-            str(exc),
-            endpoint=endpoint,
-            model=requested_model,
-            seq=seq,
-            request=payload,
-        )
+        await _reject(ex, 403, str(exc))
 
-    model = str(prepared.get("model", ""))
+    ex.request = prepared
+    ex.model = str(prepared.get("model", ""))
 
     if not cost_tracker.within_budget():
-        _reject(
-            429,
-            "Evaluation run cost budget exceeded",
-            endpoint=endpoint,
-            model=model,
-            seq=seq,
-            request=prepared,
-        )
+        await _reject(ex, 429, "Evaluation run cost budget exceeded")
 
-    await _enforce_runtime_openrouter_policy(
-        authorization=authorization,
-        endpoint=endpoint,
-        model=model,
-        seq=seq,
-        request=prepared,
-    )
+    await _enforce_runtime_openrouter_policy(authorization=authorization, ex=ex)
 
-    start = time.monotonic()
+    ex.start = time.monotonic()
     try:
         upstream_resp = await app.state.upstream.post(
             f"{UPSTREAM_BASE_URL}{path}",
@@ -528,100 +549,72 @@ async def _proxy_to_openrouter(
                 authorization=authorization, content_type=content_type
             ),
         )
-        latency_ms = int((time.monotonic() - start) * 1000)
-        body = upstream_resp.json()
-    except Exception as exc:
-        # Log the failed exchange, then let the original error propagate.
+    except httpx.HTTPError as exc:
         detail = f"{type(exc).__name__}: {exc}"
-        _append_inference_log(
-            InferenceLogEntry(
-                endpoint=endpoint,
-                model=model,
-                status_code=502,
-                total_cost_usd=cost_tracker.total_cost(),
-                budget_remaining_usd=cost_tracker.budget_remaining(),
-                latency_ms=int((time.monotonic() - start) * 1000),
-                seq=seq,
-                error=detail[:200],
-            ).to_dict()
-        )
-        _record_payload(
-            seq=seq,
-            endpoint=endpoint,
+        await _log_exchange(ex, status_code=502, error=detail)
+        return JSONResponse(
             status_code=502,
-            request=prepared,
-            error=detail,
-        )
-        raise
-
-    if upstream_resp.status_code < 400:
-        prompt_tokens, completion_tokens, cost = _extract_usage(body)
-        provider = _extract_provider(body)
-        routed_model: str | None = body.get("model")
-        generation_id: str | None = body.get("id")
-        cost_tracker.add_usage(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cost=cost,
-        )
-        _flush_usage_to_file()
-        _append_inference_log(
-            InferenceLogEntry(
-                endpoint=endpoint,
-                model=model,
-                status_code=upstream_resp.status_code,
-                total_cost_usd=cost_tracker.total_cost(),
-                budget_remaining_usd=cost_tracker.budget_remaining(),
-                seq=seq,
-                routed_model=routed_model,
-                provider=provider,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cost_usd=cost,
-                latency_ms=latency_ms,
-                generation_id=generation_id,
-            ).to_dict()
-        )
-        over_budget = not cost_tracker.within_budget()
-        _record_payload(
-            seq=seq,
-            endpoint=endpoint,
-            status_code=upstream_resp.status_code,
-            request=prepared,
-            response=body,
-            generation_id=generation_id,
-            returned_status_code=429 if over_budget else None,
-        )
-        if over_budget:
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Evaluation run cost budget exceeded"},
-            )
-    else:
-        error_snippet = json.dumps(body)[:200]
-        _append_inference_log(
-            InferenceLogEntry(
-                endpoint=endpoint,
-                model=model,
-                status_code=upstream_resp.status_code,
-                total_cost_usd=cost_tracker.total_cost(),
-                budget_remaining_usd=cost_tracker.budget_remaining(),
-                latency_ms=latency_ms,
-                seq=seq,
-                error=error_snippet,
-            ).to_dict()
-        )
-        _record_payload(
-            seq=seq,
-            endpoint=endpoint,
-            status_code=upstream_resp.status_code,
-            request=prepared,
-            response=body,
-            error=error_snippet,
+            content={"detail": f"Upstream request failed: {type(exc).__name__}"},
         )
 
-    return JSONResponse(status_code=upstream_resp.status_code, content=body)
+    status = upstream_resp.status_code
+    try:
+        body = upstream_resp.json()
+    except ValueError:
+        body = None
+
+    if not isinstance(body, dict):
+        # Not a JSON object (e.g. an HTML error page): keep the raw text and
+        # return a real 502 so the log matches what the agent sees.
+        await _log_exchange(
+            ex,
+            status_code=status,
+            error="Upstream returned a non-object response body",
+            response={"raw_text": upstream_resp.text[:4096]},
+            returned_status_code=502,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={"detail": "Upstream returned an invalid response"},
+        )
+
+    if status >= 400:
+        await _log_exchange(
+            ex,
+            status_code=status,
+            error=json.dumps(body),
+            response=body,
+        )
+        return JSONResponse(status_code=status, content=body)
+
+    prompt_tokens, completion_tokens, cost = _extract_usage(body)
+    generation_id: str | None = body.get("id")
+    cost_tracker.add_usage(
+        model=ex.model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cost=cost,
+    )
+    _flush_usage_to_file()
+    over_budget = not cost_tracker.within_budget()
+    await _log_exchange(
+        ex,
+        status_code=status,
+        response=body,
+        returned_status_code=429 if over_budget else None,
+        routed_model=body.get("model"),
+        provider=_extract_provider(body),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cost_usd=cost,
+        generation_id=generation_id,
+    )
+    if over_budget:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Evaluation run cost budget exceeded"},
+        )
+    return JSONResponse(status_code=status, content=body)
 
 
 # Routes
