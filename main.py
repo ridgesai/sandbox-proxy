@@ -232,8 +232,12 @@ class InferenceLogEntry:
     returned_status_code: int | None = None
     routed_model: str | None = None
     provider: str | None = None
+    serving_provider: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    cached_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    finish_reason: str | None = None
     cost_usd: float | None = None
     latency_ms: int | None = None
     generation_id: str | None = None
@@ -340,6 +344,7 @@ class _Exchange:
     endpoint: str
     model: str
     request: Any
+    received: Any = None
     start: float | None = None
     end: float | None = None
     upstream_status: int | None = None
@@ -401,8 +406,12 @@ def _write_exchange_logs(
             entry.update(request=None, response=None, truncated=True)
         else:
             deduped, new_blobs = _dedup_request(ex.request)
+            entry["request"] = deduped
+            if ex.received is not None and ex.received is not ex.request:
+                received, received_blobs = _dedup_request(ex.received)
+                new_blobs.update(received_blobs)
+                entry["received_request"] = received
             entry.update(
-                request=deduped,
                 blobs=new_blobs,
                 response=_compact_response(ex.endpoint, response),
             )
@@ -510,16 +519,65 @@ def _extract_usage(body: dict[str, Any]) -> tuple[int, int, float]:
 
 
 def _extract_provider(body: dict[str, Any]) -> str:
-    """Best-effort provider extraction from an OpenRouter response.
+    """Best-effort model vendor from an OpenRouter response.
 
-    OpenRouter returns the routed model (e.g. 'Chutes/qwen3-coder') in the
-    top-level `model` field; the provider is the prefix before the first slash.
+    This is the prefix of the routed model slug (e.g. 'deepseek' for
+    'deepseek/deepseek-r1-0528'), i.e. who made the model.
     """
     routed = body.get("model")
     if isinstance(routed, str) and "/" in routed:
         return routed.split("/")[0]
     provider = body.get("provider")
     return provider if isinstance(provider, str) and provider else "unknown"
+
+
+def _response_details(body: dict[str, Any]) -> dict[str, Any]:
+    """Optional usage details and the first choice's finish reason.
+
+    Providers report these unevenly, so each is None when absent or malformed.
+    """
+    usage = body.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+
+    def count(section: str, key: str) -> int | None:
+        details = usage.get(section)
+        value = details.get(key) if isinstance(details, dict) else None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    choices = body.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else None
+    finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
+    return {
+        "cached_tokens": count("prompt_tokens_details", "cached_tokens"),
+        "reasoning_tokens": count("completion_tokens_details", "reasoning_tokens"),
+        "finish_reason": finish_reason if isinstance(finish_reason, str) else None,
+    }
+
+
+def _serving_provider(body: dict[str, Any]) -> str | None:
+    """The provider OpenRouter routed the request to, when the body names it."""
+    provider = body.get("provider")
+    return provider if isinstance(provider, str) and provider else None
+
+
+def _body_error(body: dict[str, Any]) -> str | None:
+    """The error OpenRouter reports inside a 2xx body, if any.
+
+    Once a provider accepts a request, OpenRouter has already sent 200, so a
+    later failure arrives as an `error` object in the body instead: at the top
+    level, or inside a choice that carries partial output.
+    """
+    error = body.get("error")
+    if not error:
+        choices = body.get("choices")
+        if isinstance(choices, list):
+            error = next(
+                (c["error"] for c in choices if isinstance(c, dict) and c.get("error")),
+                None,
+            )
+    if error:
+        return json.dumps(error)[:200]
+    return None
 
 
 def _extract_bearer_token(authorization: str | None) -> str | None:
@@ -662,6 +720,7 @@ async def _proxy_to_openrouter(
         endpoint=endpoint,
         model=str(payload.get("model", "")),
         request=payload,
+        received=payload,
     )
     try:
         return await _forward_exchange(
@@ -780,15 +839,18 @@ async def _forward_exchange(
     await _log_exchange(
         ex,
         status_code=status,
+        error=_body_error(body),
         response=body,
         returned_status_code=429 if over_budget else None,
         usage_snapshot=cost_tracker.dump(),
         routed_model=routed_model if isinstance(routed_model, str) else None,
         provider=provider,
+        serving_provider=_serving_provider(body),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         cost_usd=cost,
         generation_id=body.get("id"),
+        **_response_details(body),
     )
     return reply
 
