@@ -848,3 +848,162 @@ async def test_shared_prompt_stays_defined_once_under_a_small_seen_limit(
         if blob == system
     ]
     assert len(definitions) == 1
+
+
+@pytest.mark.asyncio
+async def test_error_returned_with_200_is_logged_as_an_error(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+) -> None:
+    body = {
+        "id": "gen-err-1",
+        "error": {
+            "code": 502,
+            "message": "Provider returned error",
+            "metadata": {"error_type": "provider_error"},
+        },
+    }
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+        response = await _chat(client, auth_headers, [{"role": "user", "content": "hi"}])
+
+    assert response.status_code == 200
+    assert response.json() == body
+    (stats,) = _inferences(tmp_path)
+    assert stats["status_code"] == 200
+    assert "Provider returned error" in stats["error"]
+    assert stats["generation_id"] == "gen-err-1"
+    assert stats["cost_usd"] == 0.0
+    (payload,) = _payloads(tmp_path)
+    assert "Provider returned error" in payload["error"]
+    assert payload["response"] == body
+
+
+@pytest.mark.asyncio
+async def test_error_inside_a_choice_is_logged_as_an_error(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+) -> None:
+    # Partial output, then the provider failed: the error sits in the choice.
+    body = {
+        "id": "gen-err-2",
+        "object": "chat.completion",
+        "model": MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "partial"},
+                "finish_reason": "error",
+                "error": {"code": 502, "message": "Provider disconnected"},
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 3, "cost": 0.001},
+    }
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+        response = await _chat(client, auth_headers, [{"role": "user", "content": "hi"}])
+
+    assert response.json() == body
+    (stats,) = _inferences(tmp_path)
+    assert "Provider disconnected" in stats["error"]
+    assert stats["cost_usd"] == 0.001  # usage that was reported is still counted
+
+
+@pytest.mark.asyncio
+async def test_serving_provider_is_recorded_when_upstream_reports_it(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+) -> None:
+    with_provider = {**chat_response(model=MODEL).json(), "provider": "DeepInfra"}
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(
+            side_effect=[
+                httpx.Response(200, json=with_provider),
+                chat_response(model=MODEL),  # no `provider` field
+            ]
+        )
+        await _chat(client, auth_headers, [{"role": "user", "content": "a"}])
+        await _chat(client, auth_headers, [{"role": "user", "content": "b"}])
+
+    reported, missing = _inferences(tmp_path)
+    assert reported["serving_provider"] == "DeepInfra"
+    assert reported["provider"] == "deepseek"  # existing field keeps its meaning
+    assert missing["serving_provider"] is None
+
+
+@pytest.mark.asyncio
+async def test_cache_reasoning_tokens_and_finish_reason_are_recorded(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+) -> None:
+    detailed = chat_response(
+        model=MODEL,
+        usage={
+            "prompt_tokens": 2369,
+            "completion_tokens": 236,
+            "total_tokens": 2605,
+            "prompt_tokens_details": {"cached_tokens": 928},
+            "completion_tokens_details": {"reasoning_tokens": 120},
+        },
+    ).json()
+    detailed["choices"][0]["finish_reason"] = "tool_calls"
+    malformed = chat_response(model=MODEL).json()
+    malformed["usage"]["prompt_tokens_details"] = "oops"
+    malformed["choices"] = "oops"
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(
+            side_effect=[
+                httpx.Response(200, json=detailed),
+                chat_response(model=MODEL),  # no details at all
+                httpx.Response(200, json=malformed),
+            ]
+        )
+        for content in ("a", "b", "c"):
+            response = await _chat(client, auth_headers, [{"role": "user", "content": content}])
+            assert response.status_code == 200
+
+    reported, missing, broken = _inferences(tmp_path)
+    assert reported["cached_tokens"] == 928
+    assert reported["reasoning_tokens"] == 120
+    assert reported["finish_reason"] == "tool_calls"
+    assert missing["cached_tokens"] is None
+    assert missing["reasoning_tokens"] is None
+    assert missing["finish_reason"] == "stop"
+    assert broken["cached_tokens"] is None
+    assert broken["finish_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_request_as_received_is_kept_next_to_the_forwarded_one(
+    client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
+    mock_safe_workspace: Callable[[respx.Router], respx.Route],
+    tmp_path: Path,
+) -> None:
+    message = {"role": "user", "content": "x" * 500}
+    with respx.mock() as router:
+        mock_safe_workspace(router)
+        router.post(CHAT_URL).mock(return_value=chat_response())
+        await _chat(client, auth_headers, [message], logprobs=True, user="miner-x")
+
+    (payload,) = _payloads(tmp_path)
+    forwarded, received = payload["request"], payload["received_request"]
+    assert "logprobs" not in forwarded and "user" not in forwarded
+    assert forwarded["provider"]["zdr"] is True
+    assert received["logprobs"] is True and received["user"] == "miner-x"
+    assert "provider" not in received
+    # Both point at one stored copy of the shared message.
+    assert received["messages"] == forwarded["messages"]
+    assert list(payload["blobs"].values()) == [message]
