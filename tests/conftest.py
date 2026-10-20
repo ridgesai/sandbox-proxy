@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 import pytest
@@ -20,8 +21,38 @@ SAFE_WORKSPACE_BODY = {
 }
 
 
+def chat_response(
+    model: str = "deepseek/deepseek-r1-0528",
+    *,
+    response_id: str = "chatcmpl-test",
+    usage: dict[str, int | float] | None = None,
+    content: str = "ok",
+) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "id": response_id,
+            "object": "chat.completion",
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": usage
+            or {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+    )
+
+
 @pytest.fixture
-def proxy_modules(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+def proxy_modules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> dict[str, object]:
+    monkeypatch.setenv("PROXY_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("MAX_PAYLOAD_LOG_BYTES", raising=False)
     monkeypatch.setenv("MAX_COST_USD", "1.0")
     monkeypatch.setenv("EVALUATION_RUN_ID", "eval-run-test")
     monkeypatch.setenv("OPENROUTER_MANAGEMENT_KEY", "sk-or-mgmt-test-key")
