@@ -63,6 +63,13 @@ def proxy_modules(
     )
     monkeypatch.delenv("UPSTREAM_BASE_URL", raising=False)
     monkeypatch.delenv("INFERENCE_SEED", raising=False)
+    for name in (
+        "CAPTURE_LOGPROBS",
+        "CAPTURE_TOP_LOGPROBS",
+        "CAPTURE_REASONING",
+        "MAX_LOGPROBS_LOG_BYTES",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
     for name in ("main", "policy", "cost_tracker"):
         sys.modules.pop(name, None)
