@@ -64,6 +64,17 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
     return max(value, minimum)
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw_value = (os.getenv(name) or "").strip().lower()
+    if raw_value in {"1", "true", "yes", "on"}:
+        return True
+
+    if raw_value in {"0", "false", "no", "off"}:
+        return False
+
+    return default
+
+
 MAX_INFERENCE_SEED = 2**31 - 1
 
 
@@ -94,6 +105,17 @@ OPENROUTER_WORKSPACE_ID = (os.getenv("OPENROUTER_WORKSPACE_ID") or "").strip()
 OPENROUTER_EXPECTED_API_KEY_SHA256 = (
     os.getenv("OPENROUTER_EXPECTED_API_KEY_SHA256") or ""
 ).strip()
+
+# The most alternatives per token that OpenAI-compatible APIs accept.
+MAX_TOP_LOGPROBS = 20
+
+CAPTURE_LOGPROBS = _env_flag("CAPTURE_LOGPROBS", default=True)
+CAPTURE_TOP_LOGPROBS = min(_env_int("CAPTURE_TOP_LOGPROBS", 0), MAX_TOP_LOGPROBS)
+CAPTURE_REASONING = _env_flag("CAPTURE_REASONING", default=True)
+MAX_LOGPROBS_LOG_BYTES = _env_int("MAX_LOGPROBS_LOG_BYTES", 256 * 1024 * 1024)
+
+UPSTREAM_MODELS_PATH = "/api/v1/models"
+_logprob_models: set[str] = set()
 
 cost_tracker = CostTracker(
     evaluation_run_id=EVALUATION_RUN_ID, max_cost_usd=MAX_COST_USD
@@ -249,6 +271,7 @@ class InferenceLogEntry:
 
 # Payload log (request/response content, joined to the inference log by `seq`)
 PAYLOAD_LOG_FILENAME = "proxy_inference_payloads.jsonl"
+LOGPROBS_LOG_FILENAME = "proxy_logprobs.jsonl"
 
 # `seq` is "<boot id>-<n>": the counter is per process, so the boot id keeps
 # the two uvicorn processes (and restarts) from reusing each other's values.
@@ -365,6 +388,7 @@ def _write_exchange_logs(
     response: Any,
     returned_status_code: int | None,
     usage_snapshot: dict[str, Any] | None,
+    logprobs: list[dict[str, Any]] | None = None,
 ) -> None:
     """Append the stats line and the payload line for one exchange (best-effort).
 
@@ -420,6 +444,43 @@ def _write_exchange_logs(
     except Exception:
         logger.warning("failed to record payload for seq=%s", ex.seq, exc_info=True)
 
+    if logprobs:
+        _write_logprobs(
+            ex.seq,
+            timestamp=stats_record["timestamp"],
+            generation_id=stats_record.get("generation_id"),
+            logprobs=logprobs,
+        )
+
+
+def _write_logprobs(
+    seq: str,
+    *,
+    timestamp: str,
+    generation_id: str | None,
+    logprobs: list[dict[str, Any]],
+) -> None:
+    """Append one exchange's captured logprobs, joined to the other logs by `seq`."""
+    entry: dict[str, Any] = {
+        "seq": seq,
+        "timestamp": timestamp,
+        "generation_id": generation_id,
+    }
+    try:
+        size = os.path.getsize(os.path.join(PROXY_DATA_DIR, LOGPROBS_LOG_FILENAME))
+    except OSError:
+        size = 0
+
+    if size >= MAX_LOGPROBS_LOG_BYTES:
+        entry["truncated"] = True
+    else:
+        entry["choices"] = logprobs
+
+    try:
+        _append_line(LOGPROBS_LOG_FILENAME, _dumps_log(entry))
+    except Exception:
+        logger.warning("failed to record logprobs for seq=%s", seq, exc_info=True)
+
 
 async def _log_exchange(
     ex: _Exchange,
@@ -429,6 +490,7 @@ async def _log_exchange(
     response: Any = None,
     returned_status_code: int | None = None,
     usage_snapshot: dict[str, Any] | None = None,
+    logprobs: list[dict[str, Any]] | None = None,
     **stats: Any,
 ) -> None:
     """Log one exchange to both files without blocking the event loop.
@@ -460,14 +522,44 @@ async def _log_exchange(
             response=response,
             returned_status_code=returned_status_code,
             usage_snapshot=usage_snapshot,
+            logprobs=logprobs,
         ),
     )
 
 
 # Lifespan
+async def _load_logprob_models(client: httpx.AsyncClient) -> None:
+    """Record which models list `logprobs` in the upstream catalog (best-effort)."""
+    try:
+        response = await client.get(f"{UPSTREAM_BASE_URL}{UPSTREAM_MODELS_PATH}")
+        response.raise_for_status()
+        models = response.json()["data"]
+        found = {
+            model["id"]
+            for model in models
+            if isinstance(model, dict)
+            and "logprobs" in (model.get("supported_parameters") or [])
+        }
+    # HTTP failures, a body that is not JSON, or a catalog of an unexpected shape.
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        logger.warning(
+            "model catalog unavailable, logprobs not requested: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return
+
+    _logprob_models.update(found)
+    logger.info("logprobs requested for %d catalog models", len(found))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     app.state.upstream = httpx.AsyncClient(timeout=300)
+    catalog = None
+    if CAPTURE_LOGPROBS:
+        catalog = asyncio.create_task(_load_logprob_models(app.state.upstream))
+
     restricted_models = (
         sorted(RESTRICTED_MODELS)
         if RESTRICTED_MODELS
@@ -480,6 +572,8 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
         f"restricted_models={restricted_models}"
     )
     yield
+    if catalog is not None:
+        catalog.cancel()
     await app.state.upstream.aclose()
     _flush_usage_to_file()
     logger.info("proxy shutdown %s", cost_tracker.dump())
@@ -604,7 +698,118 @@ def _prepare_payload(raw: dict[str, Any], endpoint: str) -> dict[str, Any]:
         rewritten["usage"] = {"include": True}
         if INFERENCE_SEED is not None:
             rewritten["seed"] = INFERENCE_SEED
+        if CAPTURE_LOGPROBS and _supports_logprobs(rewritten):
+            rewritten["logprobs"] = True
+            if CAPTURE_TOP_LOGPROBS:
+                rewritten["top_logprobs"] = CAPTURE_TOP_LOGPROBS
+        if _hides_reasoning(rewritten):
+            rewritten["reasoning"] = {**rewritten["reasoning"], "exclude": False}
     return rewritten
+
+
+def _requested_models(request: dict[str, Any]) -> list[str]:
+    """The models a request may be served by: `model` and any fallback `models`."""
+    requested = [request.get("model"), *(request.get("models") or [])]
+    return [name for name in requested if isinstance(name, str)]
+
+
+def _supports_logprobs(request: dict[str, Any]) -> bool:
+    """True when every requested model lists logprobs in the catalog."""
+    models = _requested_models(request)
+    return bool(models) and all(model in _logprob_models for model in models)
+
+
+def _logprobs_rejected(request: dict[str, Any], response: httpx.Response) -> bool:
+    """True when the proxy added logprobs and upstream refused the request."""
+    status = response.status_code
+    return "logprobs" in request and 400 <= status < 500 and status != 429
+
+
+def _drop_logprobs(request: dict[str, Any]) -> dict[str, Any]:
+    """Copy of `request` without the logprobs fields."""
+    return {
+        key: value
+        for key, value in request.items()
+        if key not in ("logprobs", "top_logprobs")
+    }
+
+
+def _hides_reasoning(request: Any) -> bool:
+    """True when capture is on and the agent asked not to receive reasoning."""
+    if not CAPTURE_REASONING or not isinstance(request, dict):
+        return False
+
+    reasoning = request.get("reasoning")
+    return isinstance(reasoning, dict) and bool(reasoning.get("exclude"))
+
+
+def _choices(body: dict[str, Any]) -> list[Any] | None:
+    """The `choices` of a response body, or None when it has no list of them."""
+    choices = body.get("choices")
+    return choices if isinstance(choices, list) else None
+
+
+def _without_logprobs(body: dict[str, Any]) -> dict[str, Any]:
+    """Copy of `body` with every choice's `logprobs` set to None."""
+    choices = _choices(body)
+    if choices is None:
+        return body
+
+    cleared = [
+        {**choice, "logprobs": None}
+        if isinstance(choice, dict) and "logprobs" in choice
+        else choice
+        for choice in choices
+    ]
+    return {**body, "choices": cleared}
+
+
+def _keeps_continuity(detail: Any) -> bool:
+    """True for reasoning entries a model needs back to continue: encrypted or signed."""
+    if not isinstance(detail, dict):
+        return False
+
+    return detail.get("type") == "reasoning.encrypted" or bool(detail.get("signature"))
+
+
+def _strip_reasoning(choice: Any) -> Any:
+    """Copy of `choice` whose message keeps only the reasoning needed for continuity."""
+    message = choice.get("message") if isinstance(choice, dict) else None
+    if not isinstance(message, dict):
+        return choice
+
+    kept = {key: value for key, value in message.items() if key != "reasoning"}
+    details = message.get("reasoning_details")
+    if isinstance(details, list):
+        continuity = [detail for detail in details if _keeps_continuity(detail)]
+        if continuity:
+            kept["reasoning_details"] = continuity
+        else:
+            kept.pop("reasoning_details")
+
+    return {**choice, "message": kept}
+
+
+def _without_reasoning(body: dict[str, Any]) -> dict[str, Any]:
+    """Copy of `body` without the readable reasoning in each choice's message."""
+    choices = _choices(body)
+    if choices is None:
+        return body
+
+    return {**body, "choices": [_strip_reasoning(choice) for choice in choices]}
+
+
+def _captured_logprobs(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """The non-empty `logprobs` of each choice, with the choice index."""
+    choices = _choices(body)
+    if choices is None:
+        return []
+
+    return [
+        {"index": choice.get("index", index), "logprobs": choice["logprobs"]}
+        for index, choice in enumerate(choices)
+        if isinstance(choice, dict) and choice.get("logprobs")
+    ]
 
 
 async def _reject(ex: _Exchange, status: int, detail: str) -> NoReturn:
@@ -772,15 +977,26 @@ async def _forward_exchange(
 
     await _enforce_runtime_openrouter_policy(authorization=authorization, ex=ex)
 
-    ex.start = time.monotonic()
-    try:
-        upstream_resp = await app.state.upstream.post(
+    async def send(content: bytes) -> httpx.Response:
+        return await app.state.upstream.post(
             f"{UPSTREAM_BASE_URL}{path}",
-            content=upstream_body,
+            content=content,
             headers=_forward_headers(
                 authorization=authorization, content_type=content_type
             ),
         )
+
+    ex.start = time.monotonic()
+    try:
+        upstream_resp = await send(upstream_body)
+        if _logprobs_rejected(prepared, upstream_resp):
+            # Some providers reject logprobs although the catalog lists them.
+            # Resend without them, and stop adding them for these models.
+            logger.info("logprobs rejected for %s, resending without", ex.model)
+            _logprob_models.difference_update(_requested_models(prepared))
+            prepared = _drop_logprobs(prepared)
+            ex.request = prepared
+            upstream_resp = await send(_encode_body(prepared))
     except httpx.HTTPError as exc:
         ex.end = time.monotonic()
         detail = f"{type(exc).__name__}: {exc}"
@@ -827,6 +1043,13 @@ async def _forward_exchange(
         cost=cost,
     )
     over_budget = not cost_tracker.within_budget()
+    logprobs = _captured_logprobs(body) if CAPTURE_LOGPROBS else []
+    logged_body = _without_logprobs(body) if CAPTURE_LOGPROBS else body
+    agent_body = (
+        _without_reasoning(logged_body)
+        if _hides_reasoning(ex.received)
+        else logged_body
+    )
     # Build the reply before logging so nothing after the log call can fail.
     reply = (
         JSONResponse(
@@ -834,13 +1057,14 @@ async def _forward_exchange(
             content={"detail": "Evaluation run cost budget exceeded"},
         )
         if over_budget
-        else JSONResponse(status_code=status, content=body)
+        else JSONResponse(status_code=status, content=agent_body)
     )
     await _log_exchange(
         ex,
         status_code=status,
         error=_body_error(body),
-        response=body,
+        response=logged_body,
+        logprobs=logprobs,
         returned_status_code=429 if over_budget else None,
         usage_snapshot=cost_tracker.dump(),
         routed_model=routed_model if isinstance(routed_model, str) else None,
