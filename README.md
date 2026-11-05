@@ -2,7 +2,7 @@
 
 ## Logs
 
-The proxy writes three files to `PROXY_DATA_DIR` (default `/proxy-data`).
+The proxy writes these files to `PROXY_DATA_DIR` (default `/proxy-data`).
 They ship with the Harbor job artifact. Headers, including `Authorization`,
 are never logged.
 
@@ -11,6 +11,7 @@ are never logged.
 | `proxy_usage.json` | Cumulative cost snapshot for the run, rewritten after each successful call and at shutdown. |
 | `proxy_inferences.jsonl` | One stats line per request. |
 | `proxy_inference_payloads.jsonl` | One content line per request, joined to the stats line by `seq`. |
+| `proxy_logprobs.jsonl` | Unless `CAPTURE_LOGPROBS` is off: one line per response that carried logprobs, joined by `seq`. |
 
 `seq` is `<boot id>-<n>`. Each proxy process has its own boot id, so values
 never collide across processes or restarts.
@@ -48,3 +49,23 @@ never collide across processes or restarts.
 - Content logging stops once the file reaches `MAX_PAYLOAD_LOG_BYTES`
   (default 64 MiB). Later lines keep `seq`, status and error, and carry
   `truncated: true` with no request or response.
+
+## Extra capture
+
+Both switches are on by default; set one to `false` to turn it off. Each asks
+upstream for more than the agent requested, logs the extra, and removes it from
+the reply, so the agent sees what it would have without the switch.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `CAPTURE_LOGPROBS` | `true` | Requests logprobs only for models whose upstream catalog entry lists them (some, like OpenAI reasoning models, reject them). If a provider refuses anyway, the call is resent once without them. Logprobs go to `proxy_logprobs.jsonl`; the reply and payload log show `null`. |
+| `CAPTURE_TOP_LOGPROBS` | `0` | Alternatives per token, up to 20. |
+| `MAX_LOGPROBS_LOG_BYTES` | 256 MiB | Size cap for `proxy_logprobs.jsonl`; past it, lines keep only `seq` and `truncated: true`. |
+| `CAPTURE_REASONING` | `true` | Sends `reasoning.exclude: false` upstream when the agent asked for `true`, logs the reasoning, and strips the readable part from the reply. Encrypted and signed entries still reach the agent, since agents may pass them back. |
+
+Caveats:
+
+- Logprob coverage depends on the serving provider; some return `null`, and
+  tool-call arguments are never covered.
+- xAI, Amazon Nova and Cohere return readable reasoning even with
+  `exclude: true`; with capture on, agents no longer receive it.
