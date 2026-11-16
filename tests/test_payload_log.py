@@ -9,7 +9,7 @@ import httpx
 import pytest
 import respx
 
-from .conftest import chat_response
+from .conftest import chat_response, mock_policy
 
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 EMBEDDING_URL = "https://openrouter.ai/api/v1/embeddings"
@@ -646,9 +646,8 @@ async def test_other_exits_are_logged(
     mock_safe_workspace: Callable[[respx.Router], respx.Route],
     tmp_path: Path,
 ) -> None:
-    workspace_url = "https://openrouter.ai/api/v1/workspaces/workspace-test"
     with respx.mock(assert_all_called=False) as router:
-        router.get(workspace_url).mock(return_value=httpx.Response(200, json=[]))
+        mock_policy(router, workspace=httpx.Response(200, json=[]))
         upstream = router.post(CHAT_URL).mock(return_value=chat_response())
         r1 = await _chat(client, auth_headers, [{"role": "user", "content": "1"}])
         assert not upstream.called
