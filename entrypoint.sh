@@ -9,8 +9,9 @@ cat /etc/ssl/certs/ca-certificates.crt /certs/ca.crt > /certs/output/ca-bundle.c
 cp /certs/ca.crt /certs/output/ridges-ca.crt
 
 if [ "$(id -u)" -ne 0 ]; then
-  # Kubernetes mode: high ports + SNI router.
-  uvicorn main:app --host 0.0.0.0 --port 8080 &
+  # Kubernetes mode: high ports + SNI router. Plain HTTP on 8080
+  # (SANDBOX_PROXY_URL and probes) relays into the single TLS metering process.
+  socat TCP-LISTEN:8080,fork,reuseaddr OPENSSL:127.0.0.1:8443,verify=0 &
   uvicorn main:app --host 127.0.0.1 --port 8443 \
     --ssl-keyfile /certs/server.key \
     --ssl-certfile /certs/server.crt &
