@@ -7,7 +7,7 @@ import httpx
 import pytest
 import respx
 
-from .conftest import chat_response
+from .conftest import chat_response, mock_policy
 
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 WORKSPACE_URL = "https://openrouter.ai/api/v1/workspaces/workspace-test"
@@ -168,7 +168,7 @@ async def test_budget_exceeded_returns_429(
                     "total_tokens": 2000,
                     "cost": 0.001,
                 },
-            )
+            ),
         )
         response = await client.post(
             "/api/v1/chat/completions",
@@ -205,8 +205,9 @@ async def test_unsafe_workspace_flags_return_403(
     client: httpx.AsyncClient, auth_headers: dict[str, str]
 ) -> None:
     with respx.mock(assert_all_called=True) as router:
-        router.get(WORKSPACE_URL).mock(
-            return_value=httpx.Response(
+        mock_policy(
+            router,
+            workspace=httpx.Response(
                 200,
                 json={
                     "data": {
@@ -215,7 +216,7 @@ async def test_unsafe_workspace_flags_return_403(
                         "is_data_discount_logging_enabled": False,
                     }
                 },
-            )
+            ),
         )
         response = await client.post(
             "/api/v1/chat/completions",
@@ -235,10 +236,11 @@ async def test_workspace_policy_lookup_failure_returns_503(
     client: httpx.AsyncClient, auth_headers: dict[str, str]
 ) -> None:
     with respx.mock(assert_all_called=True) as router:
-        router.get(WORKSPACE_URL).mock(
-            return_value=httpx.Response(
+        mock_policy(
+            router,
+            workspace=httpx.Response(
                 503, json={"error": {"message": "upstream unavailable"}}
-            )
+            ),
         )
         response = await client.post(
             "/api/v1/chat/completions",
