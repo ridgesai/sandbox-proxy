@@ -19,6 +19,33 @@ SAFE_WORKSPACE_BODY = {
         "is_data_discount_logging_enabled": False,
     }
 }
+BYOK_URL = "https://openrouter.ai/api/v1/byok"
+BYOK_PARAMS = {"workspace_id": "workspace-test", "limit": "1"}
+NO_BYOK_BODY = {"data": [], "total_count": 0}
+KEY_URL = (
+    "https://openrouter.ai/api/v1/keys/"
+    + hashlib.sha256(RUNTIME_API_KEY.encode("utf-8")).hexdigest()
+)
+KEY_IN_WORKSPACE_BODY = {"data": {"workspace_id": "workspace-test"}}
+
+
+def mock_policy(
+    router: respx.Router,
+    *,
+    key: httpx.Response | None = None,
+    workspace: httpx.Response | None = None,
+    byok: httpx.Response | None = None,
+) -> respx.Route:
+    """Mock the three management lookups; each defaults to a passing answer."""
+    router.get(KEY_URL).mock(
+        return_value=key or httpx.Response(200, json=KEY_IN_WORKSPACE_BODY)
+    )
+    router.get(BYOK_URL, params=BYOK_PARAMS).mock(
+        return_value=byok or httpx.Response(200, json=NO_BYOK_BODY)
+    )
+    return router.get(WORKSPACE_URL).mock(
+        return_value=workspace or httpx.Response(200, json=SAFE_WORKSPACE_BODY)
+    )
 
 
 def chat_response(
@@ -104,8 +131,6 @@ def auth_headers() -> dict[str, str]:
 @pytest.fixture
 def mock_safe_workspace() -> Callable[[respx.Router], respx.Route]:
     def _mock(router: respx.Router) -> respx.Route:
-        return router.get(WORKSPACE_URL).mock(
-            return_value=httpx.Response(200, json=SAFE_WORKSPACE_BODY)
-        )
+        return mock_policy(router)
 
     return _mock
