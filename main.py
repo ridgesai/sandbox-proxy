@@ -125,6 +125,34 @@ cost_tracker = CostTracker(
 # Persistence helpers
 INFERENCE_LOG_FILENAME = "proxy_inferences.jsonl"
 USAGE_FILENAME = "proxy_usage.json"
+BYOK_BLOCK_FILENAME = "byok_blocked.json"
+_byok_blocked_here = False
+
+BYOK_DETAIL = (
+    "OpenRouter BYOK provider keys are not allowed; this run's inference is blocked"
+)
+
+
+def _byok_blocked() -> bool:
+    if _byok_blocked_here:
+        return True
+    return bool(PROXY_DATA_DIR) and os.path.exists(
+        os.path.join(PROXY_DATA_DIR, BYOK_BLOCK_FILENAME)
+    )
+
+
+def _block_byok(seq: str) -> None:
+    """Block every later request in this run, in this and any sibling process."""
+    global _byok_blocked_here
+    _byok_blocked_here = True
+    if not PROXY_DATA_DIR:
+        return
+    marker = {"seq": seq, "blocked_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        with open(os.path.join(PROXY_DATA_DIR, BYOK_BLOCK_FILENAME), "w") as f:
+            json.dump(marker, f)
+    except OSError:
+        logger.warning("failed to write the BYOK block marker", exc_info=True)
 
 # Files whose last write failed; used to warn once per outage instead of per write.
 _failing_files: set[str] = set()
@@ -612,6 +640,33 @@ def _extract_usage(body: dict[str, Any]) -> tuple[int, int, float]:
     )
 
 
+def _is_byok(body: Any) -> bool:
+    """Whether OpenRouter served this response with the account's own provider key."""
+    usage = body.get("usage") if isinstance(body, dict) else None
+    return isinstance(usage, dict) and usage.get("is_byok") is True
+
+
+def _byok_cost(body: dict[str, Any]) -> float:
+    """The real price of a BYOK response.
+
+    OpenRouter bills BYOK requests at `usage.cost` (often 0) and reports the
+    provider's own charge separately in `cost_details.upstream_inference_cost`.
+    """
+    usage = body.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    details = usage.get("cost_details")
+    details = details if isinstance(details, dict) else {}
+    total = 0.0
+    for value in (usage.get("cost"), details.get("upstream_inference_cost")):
+        try:
+            amount = float(value or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(amount) and amount > 0:
+            total += amount
+    return total
+
+
 def _extract_provider(body: dict[str, Any]) -> str:
     """Best-effort model vendor from an OpenRouter response.
 
@@ -822,10 +877,11 @@ async def _enforce_runtime_openrouter_policy(
 ) -> None:
     """Fail unless the runtime key matches and the workspace is privacy-safe.
 
-    Every proxied inference must use the uploaded OpenRouter runtime key. This
-    helper also checks the owning workspace via the management key and rejects
-    requests whenever OpenRouter observability or data-sharing flags are
-    enabled.
+    Every proxied inference must use the uploaded OpenRouter runtime key. Via
+    the management key, this helper also rejects requests when that key has
+    left the uploaded workspace, when the workspace has observability or
+    data-sharing flags enabled, or when it has any BYOK provider credentials.
+    Any lookup that fails or returns an unexpected body fails closed.
     """
     token = _extract_bearer_token(authorization)
     if token is None:
@@ -845,35 +901,40 @@ async def _enforce_runtime_openrouter_policy(
             ex, 403, "The runtime OpenRouter API key does not match the uploaded key"
         )
 
-    try:
-        workspace_response = await app.state.upstream.get(
-            f"{UPSTREAM_BASE_URL}/api/v1/workspaces/{OPENROUTER_WORKSPACE_ID}",
-            headers={"Authorization": f"Bearer {OPENROUTER_MANAGEMENT_KEY}"},
-        )
-    except httpx.HTTPError as exc:
+    # The three lookups run concurrently;
+    # Inference is only sent after all three pass.
+    (key_body, key_failure), (workspace_body, workspace_failure), (
+        byok_body,
+        byok_failure,
+    ) = await asyncio.gather(
+        _management_get(f"/api/v1/keys/{OPENROUTER_EXPECTED_API_KEY_SHA256}"),
+        _management_get(f"/api/v1/workspaces/{OPENROUTER_WORKSPACE_ID}"),
+        _management_get(
+            "/api/v1/byok",
+            params={"workspace_id": OPENROUTER_WORKSPACE_ID, "limit": 1},
+        ),
+    )
+    for label, failure in (
+        ("key", key_failure),
+        ("workspace", workspace_failure),
+        ("BYOK", byok_failure),
+    ):
+        if failure:
+            await _reject(ex, 503, f"OpenRouter {label} policy check {failure}")
+
+    # OpenRouter's key hash is the key's sha256. A key moved to another
+    # workspace would otherwise keep passing the checks of the uploaded one.
+    key_data = key_body.get("data") if isinstance(key_body, dict) else None
+    key_workspace = key_data.get("workspace_id") if isinstance(key_data, dict) else None
+    if not isinstance(key_workspace, str):
+        await _reject(ex, 503, "OpenRouter key policy check returned an unexpected body")
+    if key_workspace != OPENROUTER_WORKSPACE_ID:
         await _reject(
-            ex,
-            503,
-            f"OpenRouter workspace policy check failed: {type(exc).__name__}: {exc}",
+            ex, 403, "The runtime OpenRouter API key is not in the uploaded workspace"
         )
 
-    if workspace_response.status_code >= 400:
-        await _reject(
-            ex,
-            503,
-            f"OpenRouter workspace policy check failed with status {workspace_response.status_code}",
-        )
-
-    try:
-        workspace_body = workspace_response.json()
-    except ValueError as exc:
-        await _reject(
-            ex,
-            503,
-            f"OpenRouter workspace policy check returned invalid JSON: {exc}",
-        )
     workspace_data = (
-        workspace_body.get("data") or {} if isinstance(workspace_body, dict) else None
+        workspace_body.get("data") if isinstance(workspace_body, dict) else None
     )
     if not isinstance(workspace_data, dict):
         await _reject(
@@ -893,6 +954,63 @@ async def _enforce_runtime_openrouter_policy(
         await _reject(
             ex, 403, "OpenRouter workspace logging or data-sharing settings are enabled"
         )
+
+    credentials = byok_body.get("data") if isinstance(byok_body, dict) else None
+    total = byok_body.get("total_count") if isinstance(byok_body, dict) else None
+    if (
+        not isinstance(credentials, list)
+        or not isinstance(total, int)
+        or isinstance(total, bool)
+    ):
+        await _reject(
+            ex, 503, "OpenRouter BYOK policy check returned an unexpected body"
+        )
+    if credentials or total > 0:
+        await _reject(ex, 403, "OpenRouter BYOK provider keys are configured")
+
+
+async def _management_get(
+    path: str, params: dict[str, Any] | None = None
+) -> tuple[Any, str | None]:
+    """GET an OpenRouter management endpoint without raising.
+
+    Returns (json body, None), or (None, failure detail) for any transport
+    error, non-200 status, or invalid JSON, so concurrent lookups all finish
+    before the caller rejects.
+    """
+    try:
+        response = await app.state.upstream.get(
+            f"{UPSTREAM_BASE_URL}{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {OPENROUTER_MANAGEMENT_KEY}"},
+        )
+    except httpx.HTTPError as exc:
+        return None, f"failed: {type(exc).__name__}: {exc}"
+    if response.status_code != 200:
+        return None, f"failed with status {response.status_code}"
+    try:
+        return response.json(), None
+    except ValueError as exc:
+        return None, f"returned invalid JSON: {exc}"
+
+
+async def _byok_response(
+    ex: _Exchange, upstream_resp: httpx.Response, body: Any
+) -> JSONResponse:
+    """Block the run, charge the real price, and withhold a BYOK reply."""
+    _block_byok(ex.seq)
+    cost = _byok_cost(body) if isinstance(body, dict) else 0.0
+    cost_tracker.add_usage(model=ex.model, prompt_tokens=0, cost=cost)
+    await _log_exchange(
+        ex,
+        status_code=upstream_resp.status_code,
+        error="BYOK response withheld",
+        response=body,
+        returned_status_code=403,
+        usage_snapshot=cost_tracker.dump(),
+        cost_usd=cost,
+    )
+    return JSONResponse(status_code=403, content={"detail": BYOK_DETAIL})
 
 
 # Core proxy
@@ -975,6 +1093,9 @@ async def _forward_exchange(
     if not cost_tracker.within_budget():
         await _reject(ex, 429, "Evaluation run cost budget exceeded")
 
+    if _byok_blocked():
+        await _reject(ex, 403, BYOK_DETAIL)
+
     await _enforce_runtime_openrouter_policy(authorization=authorization, ex=ex)
 
     async def send(content: bytes) -> httpx.Response:
@@ -989,7 +1110,7 @@ async def _forward_exchange(
     ex.start = time.monotonic()
     try:
         upstream_resp = await send(upstream_body)
-        if _logprobs_rejected(prepared, upstream_resp):
+        if _logprobs_rejected(prepared, upstream_resp) and not _byok_blocked():
             # Some providers reject logprobs although the catalog lists them.
             # Resend without them, and stop adding them for these models.
             logger.info("logprobs rejected for %s, resending without", ex.model)
@@ -1020,6 +1141,9 @@ async def _forward_exchange(
         return await _upstream_unusable(
             ex, upstream_resp, "Upstream returned a non-object response body"
         )
+
+    if _is_byok(body):
+        return await _byok_response(ex, upstream_resp, body)
 
     if status >= 400:
         error_response = JSONResponse(status_code=status, content=body)
